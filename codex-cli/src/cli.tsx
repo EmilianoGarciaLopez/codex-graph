@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 import "dotenv/config";
 
 // Hack to suppress deprecation warnings (punycode)
@@ -9,20 +10,22 @@ import type { AppRollout } from "./app";
 import type { ApprovalPolicy } from "./approvals";
 import type { CommandConfirmation } from "./utils/agent/agent-loop";
 import type { AppConfig } from "./utils/config";
-import type { ResponseItem } from "openai/resources/responses/responses";
+import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
 import App from "./app";
 import { runSinglePass } from "./cli-singlepass";
 import { AgentLoop } from "./utils/agent/agent-loop";
+import { initLogger, log } from "./utils/agent/log"; // Added log imports
 import { ReviewDecision } from "./utils/agent/review";
 import { AutoApprovalMode } from "./utils/auto-approval-mode";
-import { checkForUpdates } from "./utils/check-updates";
 import {
   getApiKey,
   loadConfig,
   PRETTY_PRINT,
   INSTRUCTIONS_FILEPATH,
 } from "./utils/config";
+import { buildDependencyGraph } from "./utils/graph/builder"; // Import graph builder
+import { loadGraph } from "./utils/graph/storage"; // Import graph loader
 import { createInputItem } from "./utils/input-utils";
 import { initLogger } from "./utils/logger/log";
 import { isModelSupportedForResponses } from "./utils/model-utils.js";
@@ -30,20 +33,15 @@ import { parseToolCall } from "./utils/parsers";
 import { onExit, setInkRenderer } from "./utils/terminal";
 import chalk from "chalk";
 import { spawnSync } from "child_process";
-import fs from "fs";
+import fs from "fs"; // Keep fs sync import
 import { render } from "ink";
 import meow from "meow";
-import path from "path";
+import path from "path"; // Keep path import
 import React from "react";
 
 // Call this early so `tail -F "$TMPDIR/oai-codex/codex-cli-latest.log"` works
 // immediately. This must be run with DEBUG=1 for logging to work.
 initLogger();
-
-// TODO: migrate to new versions of quiet mode
-//
-//     -q, --quiet    Non-interactive quiet mode that only prints final message
-//     -j, --json     Non-interactive JSON output mode that prints JSON messages
 
 const cli = meow(
   `
@@ -63,6 +61,7 @@ const cli = meow(
     -c, --config                    Open the instructions file in your editor
     -w, --writable-root <path>      Writable folder for sandbox in full-auto mode (can be specified multiple times)
     -a, --approval-mode <mode>      Override the approval policy: 'suggest', 'auto-edit', or 'full-auto'
+    --graph                         Enable graph-based context strategy (experimental)
 
     --auto-edit                Automatically approve file edits; still prompt for commands
     --full-auto                Automatically approve edits and commands when executed in the sandbox
@@ -165,7 +164,11 @@ const cli = meow(
         type: "boolean",
         description: "Enable desktop notifications for responses",
       },
-
+      // Graph mode flag
+      graph: {
+        type: "boolean",
+        description: "Enable graph-based context strategy (experimental)",
+      },
       disableResponseStorage: {
         type: "boolean",
         description:
@@ -231,7 +234,8 @@ if (cli.flags.config) {
 
   const filePath = INSTRUCTIONS_FILEPATH;
   const editor =
-    process.env["EDITOR"] || (process.platform === "win32" ? "notepad" : "vi");
+    process.env["EDITOR"] ||
+    (process.platform === "win32" ? "notepad" : "vi");
   spawnSync(editor, [filePath], { stdio: "inherit" });
   process.exit(0);
 }
@@ -246,6 +250,8 @@ let config = loadConfig(undefined, undefined, {
   disableProjectDoc: Boolean(cli.flags.noProjectDoc),
   projectDocPath: cli.flags.projectDoc,
   isFullContext: fullContextMode,
+  // Pass graph flag to loadConfig
+  graphMode: Boolean(cli.flags.graph),
 });
 
 const prompt = cli.input[0];
@@ -294,6 +300,8 @@ config = {
     cli.flags.disableResponseStorage !== undefined
       ? Boolean(cli.flags.disableResponseStorage)
       : config.disableResponseStorage,
+  // Ensure graphMode is correctly set in the final config
+  graphMode: Boolean(cli.flags.graph),
 };
 
 // Check for updates after loading config. This is important because we write state file in
@@ -324,9 +332,9 @@ if (
   // eslint-disable-next-line no-console
   console.error(
     `The model "${config.model}" does not appear in the list of models ` +
-      `available to your account. Double-check the spelling (use\n` +
-      `  openai models list\n` +
-      `to see the full list) or choose another model with the --model flag.`,
+    `available to your account. Double-check the spelling (use\n` +
+    `  openai models list\n` +
+    `to see the full list) or choose another model with the --model flag.`,
   );
   process.exit(1);
 }
@@ -412,6 +420,71 @@ const approvalPolicy: ApprovalPolicy =
   cli.flags.fullAuto || cli.flags.approvalMode === "full-auto"
     ? AutoApprovalMode.FULL_AUTO
     : cli.flags.autoEdit || cli.flags.approvalMode === "auto-edit"
+      ? AutoApprovalMode.AUTO_EDIT
+      : AutoApprovalMode.SUGGEST;
+
+// --- Graph Mode Initialization ---
+if (config.graphMode) {
+  log("Graph mode enabled.");
+  const projectRoot = process.cwd();
+  const graphDir = path.join(projectRoot, ".codex");
+  const graphPath = path.join(graphDir, "dependency_graph.json");
+
+  if (!fs.existsSync(graphPath)) {
+    log(`Graph file not found at ${graphPath}. Building graph...`);
+    // Show a message to the user that graph building is starting
+    // eslint-disable-next-line no-console
+    console.log(
+      chalk.yellow(
+        "Building project dependency graph (this might take a while)...",
+      ),
+    );
+    try {
+      await buildDependencyGraph(
+        projectRoot,
+        graphPath,
+        config.model,
+        config.apiKey ?? "",
+      );
+      log("Graph build complete.");
+      // eslint-disable-next-line no-console
+      console.log(chalk.green("Dependency graph built successfully."));
+
+      // --- Print graph after building ---
+      const graphData = await loadGraph(graphPath);
+      if (graphData) {
+        // eslint-disable-next-line no-console
+        console.log("\n--- Dependency Graph ---");
+        // eslint-disable-next-line no-console
+        console.log(JSON.stringify(graphData, null, 2));
+        // eslint-disable-next-line no-console
+        console.log("--- End Dependency Graph ---\n");
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(chalk.yellow("Could not load graph data after building."));
+      }
+      // --- End Print graph ---
+
+    } catch (error) {
+      log(`Error building dependency graph: ${error}`);
+      // eslint-disable-next-line no-console
+      console.error(
+        chalk.red(
+          `Failed to build dependency graph. Continuing without graph features. Error: ${error}`,
+        ),
+      );
+      // Disable graph mode if build fails? Or allow proceeding?
+      // For now, let's disable it to avoid errors later.
+      config.graphMode = false;
+    }
+  } else {
+    log(`Graph file found at ${graphPath}. Loading graph...`);
+    // Optionally add logic here to check if the graph is stale and needs rebuilding
+  }
+}
+// --- End Graph Mode Initialization ---
+
+preloadModels();
     ? AutoApprovalMode.AUTO_EDIT
     : config.approvalMode || AutoApprovalMode.SUGGEST;
 

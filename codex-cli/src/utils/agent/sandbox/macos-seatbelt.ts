@@ -28,7 +28,9 @@ export function execWithSeatbelt(
     const { policies, params } = fullWritableRoots
       .map((root, index) => ({
         policy: `(subpath (param "WRITABLE_ROOT_${index}"))`,
-        param: `-DWRITABLE_ROOT_${index}=${root}`,
+        // the kernel resolves symlinks before handing them to seatbelt for checking
+        // so store the canonicalized form in the policy to be compared against
+        param: `-DWRITABLE_ROOT_${index}=${realpathSync(root)}`,
       }))
       .reduce(
         (

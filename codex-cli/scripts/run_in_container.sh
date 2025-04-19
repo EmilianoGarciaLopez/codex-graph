@@ -23,16 +23,6 @@ fi
 
 WORK_DIR=$(realpath "$WORK_DIR")
 
-# Generate a unique container name based on the normalized work directory
-CONTAINER_NAME="codex_$(echo "$WORK_DIR" | sed 's/\//_/g' | sed 's/[^a-zA-Z0-9_-]//g')"
-
-# Define cleanup to remove the container on script exit, ensuring no leftover containers
-cleanup() {
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-}
-# Trap EXIT to invoke cleanup regardless of how the script terminates
-trap cleanup EXIT
-
 # Ensure a command is provided.
 if [ "$#" -eq 0 ]; then
   echo "Usage: $0 [--work_dir directory] \"COMMAND\""
@@ -45,11 +35,11 @@ if [ -z "$WORK_DIR" ]; then
   exit 1
 fi
 
-# Kill any existing container for the working directory using cleanup(), centralizing removal logic.
-cleanup
+# Remove any existing container named 'codex'.
+docker rm -f codex 2>/dev/null || true
 
 # Run the container with the specified directory mounted at the same path inside the container.
-docker run --name "$CONTAINER_NAME" -d \
+docker run --name codex -d \
   -e OPENAI_API_KEY \
   --cap-add=NET_ADMIN \
   --cap-add=NET_RAW \
@@ -67,4 +57,4 @@ quoted_args=""
 for arg in "$@"; do
   quoted_args+=" $(printf '%q' "$arg")"
 done
-docker exec -it "$CONTAINER_NAME" bash -c "cd \"/app$WORK_DIR\" && codex --full-auto ${quoted_args}"
+docker exec -it codex bash -c "cd \"/app$WORK_DIR\" && codex --full-auto ${quoted_args}"

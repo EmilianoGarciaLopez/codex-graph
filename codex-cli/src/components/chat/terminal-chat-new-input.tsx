@@ -17,6 +17,7 @@ import {
   addToHistory,
 } from "../../utils/storage/command-history.js";
 import { clearTerminal, onExit } from "../../utils/terminal.js";
+import Spinner from "../vendor/ink-spinner.js";
 import { Box, Text, useApp, useInput, useStdin } from "ink";
 import { fileURLToPath } from "node:url";
 import React, { useCallback, useState, Fragment, useEffect } from "react";
@@ -36,7 +37,39 @@ const typeHelpText = `ctrl+c to exit | "/clear" to reset context | "/help" for c
 const DEBUG_HIST =
   process.env["DEBUG_TCI"] === "1" || process.env["DEBUG_TCI"] === "true";
 
-// Placeholder for potential dynamic prompts – currently not used.
+const thinkingTexts = ["Thinking"]; /* [
+  "Consulting the rubber duck",
+  "Maximizing paperclips",
+  "Reticulating splines",
+  "Immanentizing the Eschaton",
+  "Thinking",
+  "Thinking about thinking",
+  "Spinning in circles",
+  "Counting dust specks",
+  "Updating priors",
+  "Feeding the utility monster",
+  "Taking off",
+  "Wireheading",
+  "Counting to infinity",
+  "Staring into the Basilisk",
+  "Running acausal tariff negotiations",
+  "Searching the library of babel",
+  "Multiplying matrices",
+  "Solving the halting problem",
+  "Counting grains of sand",
+  "Simulating a simulation",
+  "Asking the oracle",
+  "Detangling qubits",
+  "Reading tea leaves",
+  "Pondering universal love and transcendent joy",
+  "Feeling the AGI",
+  "Shaving the yak",
+  "Escaping local minima",
+  "Pruning the search tree",
+  "Descending the gradient",
+  "Painting the bikeshed",
+  "Securing funding",
+]; */
 
 export default function TerminalChatInput({
   isNew: _isNew,
@@ -55,7 +88,6 @@ export default function TerminalChatInput({
   openDiffOverlay,
   interruptAgent,
   active,
-  thinkingSeconds,
 }: {
   isNew: boolean;
   loading: boolean;
@@ -76,7 +108,6 @@ export default function TerminalChatInput({
   openDiffOverlay: () => void;
   interruptAgent: () => void;
   active: boolean;
-  thinkingSeconds: number;
 }): React.ReactElement {
   const app = useApp();
   const [selectedSuggestion, setSelectedSuggestion] = useState<number>(0);
@@ -370,7 +401,6 @@ export default function TerminalChatInput({
           <TerminalChatInputThinking
             onInterrupt={interruptAgent}
             active={active}
-            thinkingSeconds={thinkingSeconds}
           />
         </Box>
       ) : (
@@ -436,43 +466,15 @@ export default function TerminalChatInput({
 function TerminalChatInputThinking({
   onInterrupt,
   active,
-  thinkingSeconds,
 }: {
   onInterrupt: () => void;
   active: boolean;
-  thinkingSeconds: number;
 }) {
-  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
   const [dots, setDots] = useState("");
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
 
-  // Animate ellipsis
-  useInterval(() => {
-    setDots((prev) => (prev.length < 3 ? prev + "." : ""));
-  }, 500);
-
-  // Spinner frames with seconds embedded
-  const ballFrames = [
-    "( ●    )",
-    "(  ●   )",
-    "(   ●  )",
-    "(    ● )",
-    "(     ●)",
-    "(    ● )",
-    "(   ●  )",
-    "(  ●   )",
-    "( ●    )",
-    "(●     )",
-  ];
-  const [frame, setFrame] = useState(0);
-
-  useInterval(() => {
-    setFrame((idx) => (idx + 1) % ballFrames.length);
-  }, 80);
-
-  const frameTemplate = ballFrames[frame] ?? ballFrames[0];
-  const frameWithSeconds = (frameTemplate as string).replace(
-    "●",
-    `●${thinkingSeconds}s`,
+  const [thinkingText] = useState(
+    () => thinkingTexts[Math.floor(Math.random() * thinkingTexts.length)],
   );
 
   // ---------------------------------------------------------------------
@@ -519,7 +521,9 @@ function TerminalChatInputThinking({
     };
   }, [stdin, awaitingConfirm, onInterrupt, active, setRawMode]);
 
-  // Elapsed time provided via props – no local interval needed.
+  useInterval(() => {
+    setDots((prev) => (prev.length < 3 ? prev + "." : ""));
+  }, 500);
 
   useInput(
     (_input, key) => {
@@ -543,9 +547,9 @@ function TerminalChatInputThinking({
   return (
     <Box flexDirection="column" gap={1}>
       <Box gap={2}>
-        <Text>{frameWithSeconds}</Text>
+        <Spinner type="ball" />
         <Text>
-          Thinking
+          {thinkingText}
           {dots}
         </Text>
       </Box>

@@ -1,7 +1,4 @@
-import type {
-  ResponseItem,
-  ResponseOutputItem,
-} from "openai/resources/responses/responses.mjs";
+import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
 /**
  * Build a GitHub issues‐new URL that pre‑fills the Codex 2‑bug‑report.yml
@@ -15,7 +12,7 @@ export function buildBugReportUrl({
   platform,
 }: {
   /** Chat history so we can summarise user steps */
-  items: Array<ResponseItem | ResponseOutputItem>;
+  items: Array<ResponseItem>;
   /** CLI revision string (e.g. output of `codex --revision`) */
   cliVersion: string;
   /** Active model name */
@@ -28,10 +25,16 @@ export function buildBugReportUrl({
     labels: "bug",
   });
 
+  // Template ids -------------------------------------------------------------
   params.set("version", cliVersion);
   params.set("model", model);
-  params.set("platform", platform);
 
+  // The platform input has no explicit `id`, so GitHub falls back to a slug of
+  // the label text.  For “What platform is your computer?” that slug is:
+  //   what-platform-is-your-computer
+  params.set("what-platform-is-your-computer", platform);
+
+  // Build the steps bullet list ---------------------------------------------
   const bullets: Array<string> = [];
   for (let i = 0; i < items.length; ) {
     const entry = items[i];
@@ -47,14 +50,12 @@ export function buildBugReportUrl({
       let reasoning = 0;
       let toolCalls = 0;
       let j = i + 1;
-      while (j < items.length) {
+      while (
+        j < items.length &&
+        !(entry?.type === "message" && entry.role === "user")
+      ) {
         const it = items[j];
-        if (it?.type === "message" && it?.role === "user") {
-          break;
-        } else if (
-          it?.type === "reasoning" ||
-          (it?.type === "message" && it?.role === "assistant")
-        ) {
+        if (it?.type === "message" && it?.role === "assistant") {
           reasoning += 1;
         } else if (it?.type === "function_call") {
           toolCalls += 1;
@@ -62,10 +63,8 @@ export function buildBugReportUrl({
         j++;
       }
 
-      const codeBlock = `\`\`\`\n  ${messageText}\n  \`\`\``;
-
       bullets.push(
-        `- ${codeBlock}\n  - \`${reasoning} reasoning\` | \`${toolCalls} tool\``,
+        `- "${messageText}"\n  - \`${reasoning} reasoning steps\` | \`${toolCalls} tool calls\``,
       );
 
       i = j;

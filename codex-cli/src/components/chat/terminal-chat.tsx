@@ -1,6 +1,7 @@
+// src/components/chat/terminal-chat.tsx
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { CommandConfirmation } from "../../utils/agent/agent-loop.js";
-import type { AppConfig } from "../../utils/config.js";
+import type { AppConfig } from "../../utils/config.js"; // Includes graphMode
 import type { ColorName } from "chalk";
 import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
@@ -47,7 +48,7 @@ export type OverlayModeType =
   | "diff";
 
 type Props = {
-  config: AppConfig;
+  config: AppConfig; // Includes graphMode
   prompt?: string;
   imagePaths?: Array<string>;
   approvalPolicy: ApprovalPolicy;
@@ -105,7 +106,8 @@ async function generateCommandExplanation(
 
     // Extract the explanation from the response
     const explanation =
-      response.choices[0]?.message.content || "Unable to generate explanation.";
+      response.choices[0]?.message.content ||
+      "Unable to generate explanation.";
     return explanation;
   } catch (error) {
     log(`Error generating command explanation: ${error}`);
@@ -135,7 +137,7 @@ async function generateCommandExplanation(
 }
 
 export default function TerminalChat({
-  config,
+  config, // config includes graphMode
   prompt: _initialPrompt,
   imagePaths: _initialImagePaths,
   approvalPolicy: initialApprovalPolicy,
@@ -178,7 +180,10 @@ export default function TerminalChat({
           type: "message",
           role: "system",
           content: [
-            { type: "input_text", text: `Failed to compact context: ${err}` },
+            {
+              type: "input_text",
+              text: `Failed to compact context: ${err}`,
+            },
           ],
         } as ResponseItem,
       ]);
@@ -266,9 +271,12 @@ export default function TerminalChat({
         const commandForDisplay = formatCommandForDisplay(command);
 
         // First request for confirmation
-        let { decision: review, customDenyMessage } = await requestConfirmation(
-          <TerminalChatToolCallCommand commandForDisplay={commandForDisplay} />,
-        );
+        let { decision: review, customDenyMessage } =
+          await requestConfirmation(
+            <TerminalChatToolCallCommand
+              commandForDisplay={commandForDisplay}
+            />,
+          );
 
         // If the user wants an explanation, generate one and ask again.
         if (review === ReviewDecision.EXPLAIN) {
@@ -413,10 +421,10 @@ export default function TerminalChat({
       // Clear them to prevent subsequent runs.
       setInitialPrompt("");
       setInitialImagePaths([]);
-      agent?.run(inputItems);
+      agent?.run(inputItems, "", items); // Pass current items
     };
     processInitialInputItems();
-  }, [agent, initialPrompt, initialImagePaths]);
+  }, [agent, initialPrompt, initialImagePaths, items]); // Add items dependency
 
   // ────────────────────────────────────────────────────────────────
   // In-app warning if CLI --model isn't in fetched list
@@ -560,15 +568,17 @@ export default function TerminalChat({
               ]);
             }}
             submitInput={(inputs) => {
-              agent.run(inputs, lastResponseId || "");
+              agent.run(inputs, lastResponseId || "", items); // Pass current items
               return {};
             }}
             items={items}
-            thinkingSeconds={thinkingSeconds}
           />
         )}
         {overlayMode === "history" && (
-          <HistoryOverlay items={items} onExit={() => setOverlayMode("none")} />
+          <HistoryOverlay
+            items={items}
+            onExit={() => setOverlayMode("none")}
+          />
         )}
         {overlayMode === "model" && (
           <ModelOverlay
