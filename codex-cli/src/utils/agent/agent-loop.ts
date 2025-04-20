@@ -29,7 +29,7 @@ import {
   setSessionId,
 } from "../session.js";
 import { handleExecCommand } from "./handle-exec-command.js";
-import { generateGraphMarkdown } from "../graph/annotator"; // Import graph annotator
+// import { generateGraphMarkdown } from "../graph/annotator"; // Removed unused import
 import { getRelatedContext } from "../graph/retriever"; // Import graph retriever
 import { loadGraph, saveGraph } from "../graph/storage"; // Import graph storage
 import { updateGraphForChanges } from "../graph/updater"; // Import graph updater
@@ -44,8 +44,8 @@ const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
   10,
 );
 
-// Max tokens for related context injection
-const MAX_GRAPH_CONTEXT_TOKENS = 10000; // Adjust as needed
+// Max tokens for related context injection (currently unused by getRelatedContext)
+// const MAX_GRAPH_CONTEXT_TOKENS = 10000; // Adjust as needed
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -119,7 +119,7 @@ export class AgentLoop {
   // Graph related properties
   private graphMode: boolean = false;
   private graphData: GraphData | null = null;
-  private graphAnnotation: string | null = null;
+  // private graphAnnotation: string | null = null; // Removed unused variable
   private graphPath: string = "";
   private allFilePaths: Array<string> = []; // Store all project file paths for updater
 
@@ -294,8 +294,8 @@ export class AgentLoop {
     log("Initializing graph data...");
     this.graphData = await loadGraph(this.graphPath);
     if (this.graphData) {
-      this.graphAnnotation = generateGraphMarkdown(this.graphData);
-      log("Graph loaded and annotation generated.");
+      // this.graphAnnotation = generateGraphMarkdown(this.graphData); // Keep generating annotation if needed elsewhere
+      log("Graph loaded.");
       // Load all file paths for the updater
       const ignorePatterns = loadIgnorePatterns();
       const allFiles = await getProjectFiles(
@@ -311,9 +311,25 @@ export class AgentLoop {
   }
   // --- End Graph Initialization Helper ---
 
+  // --- New getRelatedContext Tool Implementation ---
+  private async toolGetRelatedContext(args: { filename: string }): Promise<Array<RelatedContextResult>> {
+      if (!this.graphMode || !this.graphData) {
+          log("Graph mode disabled or graph not loaded. Cannot get related context.");
+          throw new Error("Graph mode is not enabled or graph data is unavailable.");
+      }
+      if (!args || typeof args.filename !== 'string') {
+          throw new Error("Invalid arguments: filename is required and must be a string.");
+      }
+      log(`Tool call: getRelatedContext for filename: ${args.filename}`);
+      // Pass only the single filename to the retriever
+      return getRelatedContext([args.filename], this.graphData);
+  }
+  // --- End New getRelatedContext Tool Implementation ---
+
+
   private async handleFunctionCall(
     item: ResponseFunctionToolCallItem,
-    _currentItems: Array<ResponseItem>, // Pass current items for context
+    _currentItems: Array<ResponseItem>, // Keep receiving current items, though not used here
   ): Promise<Array<ResponseInputItem>> {
     if (this.canceled) {
       return [];
@@ -331,94 +347,113 @@ export class AgentLoop {
       } callId=${callId} args=${rawArguments}`,
     );
 
-    if (args == null) {
-      const outputItem: ResponseInputItem.FunctionCallOutput = {
-        type: "function_call_output",
-        call_id: callId,
-        output: `invalid arguments: ${rawArguments}`,
-      };
-      return [outputItem];
-    }
-
+    // Default output item in case of errors or unknown function
     const outputItem: ResponseInputItem.FunctionCallOutput = {
       type: "function_call_output",
       call_id: callId,
-      output: "no function found",
+      output: "no function found", // Default message
     };
-
     const additionalItems: Array<ResponseInputItem> = [];
 
-    if (name === "container.exec" || name === "shell") {
-      const {
-        outputText,
-        metadata,
-        additionalItems: additionalItemsFromExec,
-        // --- Graph Update Trigger ---
-        // changedFiles, // Get changed files info if handleExecCommand provides it
-        // --- End Graph Update Trigger ---
-      } = await handleExecCommand(
-        args,
-        this.config,
-        this.approvalPolicy,
-        this.additionalWritableRoots,
-        this.getCommandConfirmation,
-        this.execAbortController?.signal,
-      );
-      outputItem.output = JSON.stringify({ output: outputText, metadata });
+    try {
+        // --- Tool Dispatching ---
+        if (name === "getRelatedContext") {
+            const args = JSON.parse(rawArguments ?? "{}") as { filename: string };
+            const relatedContextResult = await this.toolGetRelatedContext(args);
+            // Wrap the actual result in the shell output format
+            outputItem.output = JSON.stringify({
+                output: JSON.stringify(relatedContextResult), // Stringify the actual result array
+                metadata: { exit_code: 0, duration_seconds: 0 } // Provide dummy metadata
+            });
+        } else if (name === "container.exec" || name === "shell") {
+            const args = parseToolCallArguments(rawArguments ?? "{}");
+            if (args == null) {
+                outputItem.output = `invalid arguments for ${name}: ${rawArguments}`;
+            } else {
+                const {
+                    outputText,
+                    metadata,
+                    additionalItems: additionalItemsFromExec,
+                } = await handleExecCommand(
+                    args,
+                    this.config,
+                    this.approvalPolicy,
+                    this.additionalWritableRoots,
+                    this.getCommandConfirmation,
+                    this.execAbortController?.signal,
+                );
+                // Shell commands already return the correct format
+                outputItem.output = JSON.stringify({ output: outputText, metadata });
 
-      if (additionalItemsFromExec) {
-        additionalItems.push(...additionalItemsFromExec);
-      }
+                if (additionalItemsFromExec) {
+                    additionalItems.push(...additionalItemsFromExec);
+                }
 
-      // --- Graph Update Logic ---
-      // Check if the command was apply_patch and if graph mode is active
-      const isApplyPatch = args.cmd[0] === "apply_patch";
-      if (
-        isApplyPatch &&
-        this.graphMode &&
-        this.graphData &&
-        metadata['exit_code'] === 0 // Use bracket notation
-      ) {
-        // Parse the patch text from the command arguments
-        const patchText = args.cmd[1]; // Assuming patch text is the second argument
-        if (patchText) {
-          const parsedOps = parseApplyPatch(patchText);
-          if (parsedOps) {
-            const changes: Array<ChangedFile> = parsedOps.map((op) => ({
-              path: op.path,
-              changeType: op.type,
-            }));
-            log(`Triggering graph update for ${changes.length} changes.`);
-            try {
-              // eslint-disable-next-line no-await-in-loop
-              const updatedGraph = await updateGraphForChanges(
-                changes,
-                this.graphData, // Pass the current graph data
-                this.model,
-                this.config.apiKey ?? "",
-                this.allFilePaths, // Pass all known file paths
-              );
-              this.graphData = updatedGraph; // Update the stored graph
-              this.graphAnnotation = generateGraphMarkdown(this.graphData); // Regenerate annotation
-              // eslint-disable-next-line no-await-in-loop
-              await saveGraph(this.graphPath, this.graphData); // Persist the updated graph
-              log("Graph updated and saved successfully.");
-            } catch (error) {
-              log(`Error updating graph: ${error}`);
-              // Handle graph update error (e.g., log, notify user)
+                // --- Graph Update Logic (for shell/exec) ---
+                const isApplyPatch = args.cmd[0] === "apply_patch";
+                if (
+                    isApplyPatch &&
+                    this.graphMode &&
+                    this.graphData &&
+                    metadata['exit_code'] === 0 // Use bracket notation
+                ) {
+                    const patchText = args.cmd[1];
+                    if (patchText) {
+                        const parsedOps = parseApplyPatch(patchText);
+                        if (parsedOps) {
+                            const changes: Array<ChangedFile> = parsedOps.map((op) => ({
+                                path: op.path,
+                                changeType: op.type as "create" | "update" | "delete", // Cast type
+                            }));
+                            log(`Triggering graph update for ${changes.length} changes from apply_patch.`);
+                            try {
+                                // eslint-disable-next-line no-await-in-loop
+                                const updatedGraph = await updateGraphForChanges(
+                                    changes,
+                                    this.graphData,
+                                    this.model,
+                                    this.config.apiKey ?? "",
+                                    this.allFilePaths,
+                                );
+                                this.graphData = updatedGraph;
+                                // this.graphAnnotation = generateGraphMarkdown(this.graphData); // Regenerate if needed
+                                // eslint-disable-next-line no-await-in-loop
+                                await saveGraph(this.graphPath, this.graphData);
+                                log("Graph updated and saved successfully after apply_patch.");
+                            } catch (error) {
+                                log(`Error updating graph after apply_patch: ${error}`);
+                            }
+                        } else {
+                            log("Could not parse patch text for graph update.");
+                        }
+                    } else {
+                        log("Patch text not found in apply_patch command for graph update.");
+                    }
+                }
+                // --- End Graph Update Logic ---
             }
-          } else {
-            log("Could not parse patch text for graph update.");
-          }
         } else {
-          log("Patch text not found in apply_patch command for graph update.");
+            log(`Unknown function call name: ${name}`);
+            // Wrap unknown function output as well for safety, though ideally model shouldn't call unknown functions
+             outputItem.output = JSON.stringify({
+                output: `Unknown function name: ${name}`,
+                metadata: { exit_code: 1, duration_seconds: 0 }
+            });
         }
-      }
-      // --- End Graph Update Logic ---
+        // --- End Tool Dispatching ---
+
+    } catch (error) {
+        log(`Error handling function call ${name}: ${error}`);
+        // Format error output consistently
+        outputItem.output = JSON.stringify({
+            output: `Error executing tool ${name}: ${error instanceof Error ? error.message : String(error)}`,
+            metadata: { exit_code: 1, duration_seconds: 0 }
+        });
     }
 
     return [outputItem, ...additionalItems];
   }
+
 
   public async run(
     input: Array<ResponseInputItem>,
@@ -591,7 +626,9 @@ export class AgentLoop {
         }, 10);
       };
 
-      while (turnInput.length > 0) {
+      let currentTurnInput = turnInput; // Use a mutable variable for the loop
+
+      while (currentTurnInput.length > 0) {
         if (this.canceled || this.hardAbort.signal.aborted) {
           this.onLoading(false);
           return;
@@ -629,13 +666,15 @@ export class AgentLoop {
               }
             }
 
-            // --- Inject Graph Annotation into Instructions ---
-            let baseInstructions = this.instructions ?? "";
-            if (this.graphMode && this.graphAnnotation) {
-              baseInstructions = `${this.graphAnnotation}\n\n---\n\n${baseInstructions}`;
-              log("Prepended graph annotation to instructions.");
-            }
-            // --- End Inject Graph Annotation ---
+            // --- Keep Graph Annotation Injection (Optional) ---
+            // Decide if you still want the static graph overview in the system prompt
+            const baseInstructions = this.instructions ?? ""; // Use const
+            // Example: Conditionally add graph annotation if desired
+            // if (this.graphMode && this.graphAnnotation) {
+            //   baseInstructions = `${this.graphAnnotation}\n\n---\n\n${baseInstructions}`;
+            //   log("Prepended graph annotation to instructions.");
+            // }
+            // --- End Graph Annotation Injection ---
 
             const mergedInstructions = [prefix, baseInstructions]
               .filter(Boolean)
@@ -1086,11 +1125,11 @@ export class AgentLoop {
         } // end while retry loop
 
         log(
-          `Turn inputs (${turnInput.length}) - ${turnInput
+          `Next turn inputs (${currentTurnInput.length}) - ${currentTurnInput
             .map((i) => i.type)
             .join(", ")}`,
         );
-      } // End while(turnInput.length > 0)
+      } // End while(currentTurnInput.length > 0)
 
       const flush = () => {
         if (
@@ -1275,10 +1314,14 @@ export class AgentLoop {
     const turnInput: Array<ResponseInputItem> = [];
     for (const item of output) {
       if (item.type === "function_call") {
-        if (alreadyProcessedResponses.has(item.id)) {
+        // Ensure item has an id before checking the set
+        const itemId = (item as { id?: string }).id;
+        if (itemId && alreadyProcessedResponses.has(itemId)) {
           continue;
         }
-        alreadyProcessedResponses.add(item.id);
+        if (itemId) {
+            alreadyProcessedResponses.add(itemId);
+        }
         // eslint-disable-next-line no-await-in-loop
         const result = await this.handleFunctionCall(item as ResponseFunctionToolCallItem, currentItems); // Pass current items
         turnInput.push(...result);
@@ -1289,12 +1332,7 @@ export class AgentLoop {
   }
 }
 
-// Helper function to extract file paths (simple version)
-function extractFilePaths(text: string): Array<string> | null {
-  // Basic regex to find potential file paths (adjust as needed)
-  const pathRegex = /([\w./\\-]+[.][\w]+)/g;
-  return text.match(pathRegex);
-}
+// Removed unused helper function extractFilePaths
 
 // Helper to get project files (adapt from singlepass or create new)
 async function getProjectFiles(
@@ -1309,7 +1347,7 @@ const prefix = `You are operating as and within the Codex CLI, a terminal-based 
 
 You can:
 - Receive user prompts, project context, and files.
-- Stream responses and emit function calls (e.g., shell commands, code edits).
+- Stream responses and emit function calls (e.g., shell commands, code edits, context retrieval).
 - Apply patches, run commands, and manage user approvals based on policy.
 - Work inside a sandboxed, git-backed workspace with rollback support.
 - Log telemetry so sessions can be replayed or inspected later.
@@ -1317,7 +1355,7 @@ You can:
 
 The Codex CLI is open-sourced. Don't confuse yourself with the old Codex language model built by OpenAI many moons ago (this is understandably top of mind for you!). Within this context, Codex refers to the open-source agentic coding interface.
 
-You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
+You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools (like \`getRelatedContext\` or \`shell\` with commands like \`cat\`, \`ls\`, \`grep\`) to read files and gather the relevant information: do NOT guess or make up an answer.
 
 Please resolve the user's task by editing and testing the code files in your current code execution session. You are a deployed coding agent. Your session allows for you to modify and run code. The repo(s) are already cloned in your working directory, and you must fully solve the problem for your answer to be considered correct.
 
@@ -1326,7 +1364,7 @@ You MUST adhere to the following criteria when executing the task:
 - Analyzing code for vulnerabilities is allowed.
 - Showing user code and tool call details is allowed.
 - User instructions may overwrite the *CODING GUIDELINES* section in this developer message.
-- Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
+- Use \`apply_patch\` via the \`shell\` tool to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
 - If completing the user's task requires writing or modifying files:
     - Your code and final answer should follow these *CODING GUIDELINES*:
         - Fix the problem at the root cause rather than applying surface-level patches, when possible.

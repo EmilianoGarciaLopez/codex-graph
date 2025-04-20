@@ -1,6 +1,5 @@
-// src/utils/graph/builder.ts
 import type {
-  DependencyEdge,
+  AnalyzedEdge, // Use the new edge type
   FileContent,
   GraphData,
 } from "./types";
@@ -99,7 +98,7 @@ export async function buildDependencyGraph(
   });
   // --- End Debug Logging ---
 
-  const allDiscoveredEdges: Array<DependencyEdge> = [];
+  const allDiscoveredEdges: Array<AnalyzedEdge> = []; // Use AnalyzedEdge
 
   const oai = new OpenAI({
     apiKey: apiKey || undefined,
@@ -136,7 +135,7 @@ export async function buildDependencyGraph(
   log(
     `Consolidating ${allDiscoveredEdges.length} discovered edges into graph...`,
   );
-  consolidateGraphData(graphData, allDiscoveredEdges);
+  consolidateGraphData(graphData, allDiscoveredEdges); // Pass AnalyzedEdge array
 
   const endTime = Date.now();
   log(
@@ -208,7 +207,7 @@ async function analyzeBatchDependencies(
   allFilePaths: Array<string>,
   model: string,
   oai: OpenAI,
-): Promise<Array<DependencyEdge>> {
+): Promise<Array<AnalyzedEdge>> { // Return AnalyzedEdge
   // --- Use simpler text format instead of XML ---
   const batchFileContentText = batchFiles
     .map(
@@ -222,14 +221,13 @@ async function analyzeBatchDependencies(
     .join("")}</all_project_files>`;
 
   // --- Updated Prompt ---
-  // Reference the new text format and remove the strict JSON output instruction.
+  // Ask for relationship summary
   const prompt = `
-Analyze the code for the files provided below, separated by '--- File: ...'. For *each* file in this batch, identify:
-1.  **Direct Imports/Requires:** List the *exact* file paths it imports or requires, referencing only paths from the <all_project_files> list.
-2.  **Function/Class Usage:** Identify functions or classes defined in *other* files (from <all_project_files>) that are called or instantiated within this file. Map these usages back to the file path where the function/class is likely defined (must be in <all_project_files>).
-3.  **Conceptual Links:** Identify any other files from <all_project_files> that seem conceptually related (e.g., part of the same feature, module, or data flow) even without direct code references.
+Analyze the code for the files provided below, separated by '--- File: ...'. For *each* file in this batch, identify its relationships with other files listed in <all_project_files>. For each identified relationship (source -> target):
+1.  Determine the **type**: "import" (direct import/require), "usage" (calls function/uses class defined elsewhere), or "related" (conceptual link, same feature/module).
+2.  Provide a **concise summary** (max 1-2 sentences) explaining *how* the source file relates to the target file (e.g., "Imports function X", "Uses component Y for UI", "Handles data processing for Z").
 
-Output ONLY the JSON array of dependency edges. Each edge represents 'source depends on target'. Use the format: \`[{"source": "path/to/caller.py", "target": "path/to/callee.py", "type": "import|usage|related"}, ...]\`. Be precise and include explicit dependencies found in the code, as well as strong conceptual links.
+Output ONLY the JSON array of dependency edges. Each edge represents 'source depends on target'. Use the format: \`[{"source": "path/to/caller.py", "target": "path/to/callee.py", "type": "import|usage|related", "summary": "Concise explanation of the relationship."}, ...]\`. Be precise and include explicit dependencies found in the code, as well as strong conceptual links. Ensure paths are absolute or relative to the project root provided in the file list.
 
 ${batchFileContentText}
 
@@ -245,8 +243,7 @@ ${allFilesXml}
     const response = await oai.chat.completions.create({
       model: model,
       messages: [{ role: "user", content: prompt }],
-      // --- REMOVED response_format to allow more flexibility ---
-      // response_format: { type: "json_object" },
+      // response_format: { type: "json_object" }, // Keep allowing flexible output for now
     });
 
     const content = response.choices[0]?.message?.content;
@@ -259,9 +256,9 @@ ${allFilesXml}
     }
 
     // --- Parsing Logic (Keep fallback) ---
-    let edges: Array<DependencyEdge> = [];
+    let edges: Array<AnalyzedEdge> = []; // Expect AnalyzedEdge
     try {
-      // Attempt 1: Try parsing directly as JSON (might work if model still returns pure JSON)
+      // Attempt 1: Try parsing directly as JSON
       const parsedJson = JSON.parse(content);
 
       if (Array.isArray(parsedJson)) {
@@ -270,7 +267,7 @@ ${allFilesXml}
         typeof parsedJson === "object" &&
         // eslint-disable-next-line eqeqeq
         parsedJson !== null &&
-        Array.isArray(parsedJson.edges)
+        Array.isArray(parsedJson.edges) // Check if response wrapped in { "edges": [...] }
       ) {
         edges = parsedJson.edges;
       } else {
@@ -303,7 +300,7 @@ ${allFilesXml}
     }
     // --- End Parsing Logic ---
 
-    // Validate the structure of the extracted edges
+    // Validate the structure of the extracted edges, including the summary
     if (
       !Array.isArray(edges) ||
       !edges.every(
@@ -313,11 +310,12 @@ ${allFilesXml}
           edge !== null &&
           typeof edge.source === "string" &&
           typeof edge.target === "string" &&
-          ["import", "usage", "related"].includes(edge.type),
+          ["import", "usage", "related"].includes(edge.type) &&
+          typeof edge.summary === "string" // Check for summary
       )
     ) {
       log(
-        `Parsed edge list has invalid structure: ${JSON.stringify(edges)}`,
+        `Parsed edge list has invalid structure or missing summaries: ${JSON.stringify(edges)}`,
       );
       return [];
     }
@@ -333,11 +331,11 @@ ${allFilesXml}
 }
 
 /**
- * Merges discovered edges into the main graph data structure, ensuring bidirectionality.
+ * Merges discovered edges into the main graph data structure, ensuring bidirectionality and storing summaries.
  */
 function consolidateGraphData(
   graphData: GraphData,
-  edges: Array<DependencyEdge>,
+  edges: Array<AnalyzedEdge>, // Accept AnalyzedEdge
 ): void {
   for (const edge of edges) {
     // --- Robust path handling ---
@@ -380,20 +378,22 @@ function consolidateGraphData(
     const sourceNode = graphData.nodes[sourcePath]!;
     const targetNode = graphData.nodes[targetPath]!;
 
-    // Add forward dependency (source -> target) if not present
-    if (!sourceNode.dependencies.includes(targetPath)) {
-      sourceNode.dependencies.push(targetPath);
+    // Add forward dependency (source -> target) with summary if not present
+    if (!sourceNode.dependencies.some(dep => dep.id === targetPath)) {
+      sourceNode.dependencies.push({ id: targetPath, summary: edge.summary });
     }
 
-    // Add backward dependency (target <- source) if not present
-    if (!targetNode.dependents.includes(sourcePath)) {
-      targetNode.dependents.push(sourcePath);
+    // Add backward dependency (target <- source) with summary if not present
+    if (!targetNode.dependents.some(dep => dep.id === sourcePath)) {
+      // Note: The summary describes the source->target relationship.
+      // We store the same summary on the dependent link for retrieval.
+      targetNode.dependents.push({ id: sourcePath, summary: edge.summary });
     }
   }
 
   // Optional: Sort dependency/dependent lists for consistency
   for (const node of Object.values(graphData.nodes)) {
-    node.dependencies.sort();
-    node.dependents.sort();
+    node.dependencies.sort((a, b) => a.id.localeCompare(b.id));
+    node.dependents.sort((a, b) => a.id.localeCompare(b.id));
   }
 }
