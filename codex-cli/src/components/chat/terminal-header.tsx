@@ -15,6 +15,7 @@ export interface TerminalHeaderProps {
   agent?: AgentLoop;
   initialImagePaths?: Array<string>;
   flexModeEnabled?: boolean;
+  graphEnabled?: boolean; // Add graphEnabled prop
 }
 
 const TerminalHeader: React.FC<TerminalHeaderProps> = ({
@@ -28,6 +29,7 @@ const TerminalHeader: React.FC<TerminalHeaderProps> = ({
   agent,
   initialImagePaths,
   flexModeEnabled = false,
+  graphEnabled = false, // Default to false
 }) => {
   return (
     <>
@@ -37,6 +39,7 @@ const TerminalHeader: React.FC<TerminalHeaderProps> = ({
           ● Codex v{version} - {PWD} - {model} ({provider}) -{" "}
           <Text color={colorsByPolicy[approvalPolicy]}>{approvalPolicy}</Text>
           {flexModeEnabled ? " - flex-mode" : ""}
+          {graphEnabled ? " - graph" : ""} {/* Show graph status */}
         </Text>
       ) : (
         <>
@@ -81,6 +84,12 @@ const TerminalHeader: React.FC<TerminalHeaderProps> = ({
               <Text dimColor>
                 <Text color="blueBright">↳</Text> flex-mode:{" "}
                 <Text bold>enabled</Text>
+              </Text>
+            )}
+            {graphEnabled && ( // Display graph status if enabled
+              <Text dimColor>
+                <Text color="blueBright">↳</Text> graph:{" "}
+                <Text bold color="cyan">enabled</Text>
               </Text>
             )}
             {initialImagePaths?.map((img, idx) => (

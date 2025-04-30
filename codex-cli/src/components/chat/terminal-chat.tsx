@@ -1,7 +1,6 @@
-// src/components/chat/terminal-chat.tsx
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { CommandConfirmation } from "../../utils/agent/agent-loop.js";
-import type { AppConfig } from "../../utils/config.js"; // Includes graphMode
+import type { AppConfig } from "../../utils/config.js";
 import type { ColorName } from "chalk";
 import type { ResponseItem } from "openai/resources/responses/responses.mjs";
 
@@ -48,7 +47,7 @@ export type OverlayModeType =
   | "diff";
 
 type Props = {
-  config: AppConfig; // Includes graphMode
+  config: AppConfig;
   prompt?: string;
   imagePaths?: Array<string>;
   approvalPolicy: ApprovalPolicy;
@@ -106,8 +105,7 @@ async function generateCommandExplanation(
 
     // Extract the explanation from the response
     const explanation =
-      response.choices[0]?.message.content ||
-      "Unable to generate explanation.";
+      response.choices[0]?.message.content || "Unable to generate explanation.";
     return explanation;
   } catch (error) {
     log(`Error generating command explanation: ${error}`);
@@ -137,7 +135,7 @@ async function generateCommandExplanation(
 }
 
 export default function TerminalChat({
-  config, // config includes graphMode
+  config,
   prompt: _initialPrompt,
   imagePaths: _initialImagePaths,
   approvalPolicy: initialApprovalPolicy,
@@ -154,6 +152,7 @@ export default function TerminalChat({
     initialApprovalPolicy,
   );
   const [thinkingSeconds, setThinkingSeconds] = useState(0);
+  const graphEnabled = config.graph?.enabled ?? false; // Get graph status from config
 
   const handleCompact = async () => {
     setLoading(true);
@@ -180,10 +179,7 @@ export default function TerminalChat({
           type: "message",
           role: "system",
           content: [
-            {
-              type: "input_text",
-              text: `Failed to compact context: ${err}`,
-            },
+            { type: "input_text", text: `Failed to compact context: ${err}` },
           ],
         } as ResponseItem,
       ]);
@@ -238,7 +234,7 @@ export default function TerminalChat({
     log(
       `model=${model} provider=${provider} instructions=${Boolean(
         config.instructions,
-      )} approvalPolicy=${approvalPolicy}`,
+      )} approvalPolicy=${approvalPolicy} graphEnabled=${graphEnabled}`, // Log graph status
     );
 
     // Tear down any existing loop before creating a new one.
@@ -253,6 +249,7 @@ export default function TerminalChat({
       approvalPolicy,
       disableResponseStorage: config.disableResponseStorage,
       additionalWritableRoots,
+      graphEnabled, // Pass graph status to AgentLoop
       onLastResponseId: setLastResponseId,
       onItem: (item) => {
         log(`onItem: ${JSON.stringify(item)}`);
@@ -271,12 +268,9 @@ export default function TerminalChat({
         const commandForDisplay = formatCommandForDisplay(command);
 
         // First request for confirmation
-        let { decision: review, customDenyMessage } =
-          await requestConfirmation(
-            <TerminalChatToolCallCommand
-              commandForDisplay={commandForDisplay}
-            />,
-          );
+        let { decision: review, customDenyMessage } = await requestConfirmation(
+          <TerminalChatToolCallCommand commandForDisplay={commandForDisplay} />,
+        );
 
         // If the user wants an explanation, generate one and ask again.
         if (review === ReviewDecision.EXPLAIN) {
@@ -322,8 +316,9 @@ export default function TerminalChat({
     };
     // We intentionally omit 'approvalPolicy' and 'confirmationPrompt' from the deps
     // so switching modes or showing confirmation dialogs doesn’t tear down the loop.
+    // Add graphEnabled to deps so AgentLoop is recreated if it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, provider, config, requestConfirmation, additionalWritableRoots]);
+  }, [model, provider, config, requestConfirmation, additionalWritableRoots, graphEnabled]);
 
   // Whenever loading starts/stops, reset or start a timer — but pause the
   // timer while a confirmation overlay is displayed so we don't trigger a
@@ -421,10 +416,10 @@ export default function TerminalChat({
       // Clear them to prevent subsequent runs.
       setInitialPrompt("");
       setInitialImagePaths([]);
-      agent?.run(inputItems, "", items); // Pass current items
+      agent?.run(inputItems);
     };
     processInitialInputItems();
-  }, [agent, initialPrompt, initialImagePaths, items]); // Add items dependency
+  }, [agent, initialPrompt, initialImagePaths]);
 
   // ────────────────────────────────────────────────────────────────
   // In-app warning if CLI --model isn't in fetched list
@@ -490,6 +485,7 @@ export default function TerminalChat({
               agent,
               initialImagePaths,
               flexModeEnabled: Boolean(config.flexMode),
+              graphEnabled, // Pass graph status to header
             }}
           />
         ) : (
@@ -568,17 +564,15 @@ export default function TerminalChat({
               ]);
             }}
             submitInput={(inputs) => {
-              agent.run(inputs, lastResponseId || "", items); // Pass current items
+              agent.run(inputs, lastResponseId || "");
               return {};
             }}
             items={items}
+            thinkingSeconds={thinkingSeconds}
           />
         )}
         {overlayMode === "history" && (
-          <HistoryOverlay
-            items={items}
-            onExit={() => setOverlayMode("none")}
-          />
+          <HistoryOverlay items={items} onExit={() => setOverlayMode("none")} />
         )}
         {overlayMode === "model" && (
           <ModelOverlay

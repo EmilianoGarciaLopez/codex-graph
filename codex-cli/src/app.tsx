@@ -1,4 +1,3 @@
-// src/app.tsx
 import type { ApprovalPolicy } from "./approvals";
 import type { AppConfig } from "./utils/config";
 import type { ResponseItem } from "openai/resources/responses/responses";
@@ -19,7 +18,7 @@ export type AppRollout = {
 
 type Props = {
   prompt?: string;
-  config: AppConfig; // Includes graphMode now
+  config: AppConfig;
   imagePaths?: Array<string>;
   rollout?: AppRollout;
   approvalPolicy: ApprovalPolicy;
@@ -29,7 +28,7 @@ type Props = {
 
 export default function App({
   prompt,
-  config, // config now includes graphMode
+  config,
   rollout,
   imagePaths,
   approvalPolicy,
@@ -96,7 +95,7 @@ export default function App({
 
   return (
     <TerminalChat
-      config={config} // Pass the full config including graphMode
+      config={config}
       prompt={prompt}
       imagePaths={imagePaths}
       approvalPolicy={approvalPolicy}

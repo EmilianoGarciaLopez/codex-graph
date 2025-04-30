@@ -82,4 +82,18 @@ esbuild
     plugins,
     inject: ["./require-shim.js"],
   })
+  .then(() => {
+    // Copy the visualization template after build succeeds
+    const srcTemplate = path.resolve("src/graph/visualization/template.html");
+    const destDir = path.resolve(OUT_DIR, "graph/visualization");
+    const destTemplate = path.join(destDir, "template.html");
+
+    if (fs.existsSync(srcTemplate)) {
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.copyFileSync(srcTemplate, destTemplate);
+      console.log(`Copied ${srcTemplate} to ${destTemplate}`);
+    } else {
+      console.error(`Error: Source template not found at ${srcTemplate}`);
+    }
+  })
   .catch(() => process.exit(1));

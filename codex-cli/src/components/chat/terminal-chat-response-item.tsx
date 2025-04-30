@@ -135,14 +135,14 @@ function TerminalChatResponseMessage({
               c.type === "output_text"
                 ? c.text
                 : c.type === "refusal"
-                ? c.refusal
-                : c.type === "input_text"
-                ? c.text
-                : c.type === "input_image"
-                ? "<Image>"
-                : c.type === "input_file"
-                ? c.filename
-                : "", // unknown content type
+                  ? c.refusal
+                  : c.type === "input_text"
+                    ? c.text
+                    : c.type === "input_image"
+                      ? "<Image>"
+                      : c.type === "input_file"
+                        ? c.filename
+                        : "", // unknown content type
           )
           .join(" ")}
       </Markdown>
@@ -155,6 +155,28 @@ function TerminalChatResponseToolCall({
 }: {
   message: ResponseFunctionToolCallItem;
 }) {
+  // Handle graph_tool specifically
+  if (message.name === "graph_tool") {
+    let query = "Error parsing query";
+    try {
+      const args = JSON.parse(message.arguments || "{}");
+      query = args.query || "No query provided";
+    } catch (e) {
+      // Keep default error message
+    }
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="cyan" bold>
+          graph_tool
+        </Text>
+        <Text>
+          <Text dimColor>Query:</Text> {query}
+        </Text>
+      </Box>
+    );
+  }
+
+  // Default handling for other tool calls (e.g., shell)
   const details = parseToolCall(message);
   return (
     <Box flexDirection="column" gap={1}>
@@ -162,7 +184,7 @@ function TerminalChatResponseToolCall({
         command
       </Text>
       <Text>
-        <Text dimColor>$</Text> {details?.cmdReadableText}
+        <Text dimColor>$</Text> {details?.cmdReadableText ?? message.name}
       </Text>
     </Box>
   );

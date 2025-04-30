@@ -1,11 +1,9 @@
-// src/utils/agent/agent-loop.ts
 import type { ReviewDecision } from "./review.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { AppConfig } from "../config.js";
-import type { GraphData, FileContent, ChangedFile } from "../graph/types"; // Import graph types
 import type { ResponseEvent } from "../responses.js";
 import type {
-  ResponseFunctionToolCallItem,
+  ResponseFunctionToolCall,
   ResponseInputItem,
   ResponseItem,
   ResponseCreateParams,
@@ -13,14 +11,20 @@ import type {
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
-
-import { OPENAI_TIMEOUT_MS, getApiKey, getBaseUrl } from "../config.js";
+import {
+  OPENAI_TIMEOUT_MS,
+  OPENAI_ORGANIZATION,
+  OPENAI_PROJECT,
+  getApiKey,
+  getBaseUrl,
+} from "../config.js";
 import { log } from "../logger/log.js";
-import { log, isLoggingEnabled } from "./log.js";
-import { parseApplyPatch } from "../../parse-apply-patch"; // Import patch parser
-import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
 import { responsesCreateViaChatCompletions } from "../responses.js";
+// Import maxTokensForModel
+import { maxTokensForModel } from "../model-utils.js";
+// Import approximateTokensUsed from its correct location
+import { approximateTokensUsed } from "../approximate-tokens-used.js";
 import {
   ORIGIN,
   CLI_VERSION,
@@ -29,23 +33,40 @@ import {
   setSessionId,
 } from "../session.js";
 import { handleExecCommand } from "./handle-exec-command.js";
-// import { generateGraphMarkdown } from "../graph/annotator"; // Removed unused import
-import { getRelatedContext } from "../graph/retriever"; // Import graph retriever
-import { loadGraph, saveGraph } from "../graph/storage"; // Import graph storage
-import { updateGraphForChanges } from "../graph/updater"; // Import graph updater
-import { getFileContents, loadIgnorePatterns } from "../singlepass/context_files"; // Import file utils
+// Import graph context retriever
+import { getContext as getGraphContext } from "../../graph/retriever.js";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
-import path from "path"; // Import path
+import { z } from "zod"; // Import Zod
+import { zodToJsonSchema } from "zod-to-json-schema"; // Import converter
+
+// Define the schema for the graph tool using Zod
+const graphToolSchema = z.object({
+  query: z
+    .string()
+    .describe(
+      "A natural language query describing the information needed from the codebase graph (e.g., 'Find callers of function X', 'What does function Y do?', 'Show context for file Z').",
+    ),
+});
+
+// Convert the Zod schema to a JSON Schema object
+const graphToolJsonSchema = zodToJsonSchema(graphToolSchema, "graphToolSchema");
+
+// Define the graph tool using the generated JSON Schema
+const graphTool: FunctionTool = {
+  type: "function",
+  name: "graph_tool",
+  description:
+    "Retrieves context from the codebase graph, such as function definitions, calls, summaries, and relationships, based on a natural language query.",
+  strict: true, // Enable strict schema validation
+  parameters: graphToolJsonSchema.definitions?.graphToolSchema ?? {}, // Use the converted schema
+};
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
   process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "2500",
   10,
 );
-
-// Max tokens for related context injection (currently unused by getRelatedContext)
-// const MAX_GRAPH_CONTEXT_TOKENS = 10000; // Adjust as needed
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -70,6 +91,8 @@ type AgentLoopParams = {
    * on every request and omit the `previous_response_id` parameter.
    */
   disableResponseStorage?: boolean;
+  /** Whether to enable graph context retrieval */
+  graphEnabled?: boolean;
   onItem: (item: ResponseItem) => void;
   onLoading: (loading: boolean) => void;
 
@@ -112,17 +135,19 @@ export class AgentLoop {
   private model: string;
   private provider: string;
   private instructions?: string;
-  private approvalPolicy: ApprovalPolicy;
+  public approvalPolicy: ApprovalPolicy; // Made public for overlay access
   private config: AppConfig;
   private additionalWritableRoots: ReadonlyArray<string>;
+  /** Whether we ask the API to persist conversation state on the server */
+  private readonly disableResponseStorage: boolean;
+  /** Whether to retrieve and include graph context */
+  private readonly graphEnabled: boolean;
 
-  // Graph related properties
-  private graphMode: boolean = false;
-  private graphData: GraphData | null = null;
-  // private graphAnnotation: string | null = null; // Removed unused variable
-  private graphPath: string = "";
-  private allFilePaths: Array<string> = []; // Store all project file paths for updater
-
+  // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
+  // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
+  // type to avoid sprinkling `any` across the implementation while still allowing paths where
+  // the OpenAI SDK types may not perfectly match. The `typeof OpenAI` pattern captures the
+  // instance shape without resorting to `any`.
   private oai: OpenAI;
 
   private onItem: (item: ResponseItem) => void;
@@ -133,9 +158,19 @@ export class AgentLoop {
   ) => Promise<CommandConfirmation>;
   private onLastResponseId: (lastResponseId: string) => void;
 
+  /**
+   * A reference to the currently active stream returned from the OpenAI
+   * client. We keep this so that we can abort the request if the user decides
+   * to interrupt the current task (e.g. via the escape hot‑key).
+   */
   private currentStream: unknown | null = null;
+  /** Incremented with every call to `run()`. Allows us to ignore stray events
+   * from streams that belong to a previous run which might still be emitting
+   * after the user has canceled and issued a new command. */
   private generation = 0;
+  /** AbortController for in‑progress tool calls (e.g. shell commands). */
   private execAbortController: AbortController | null = null;
+  /** Set to true when `cancel()` is called so `run()` can exit early. */
   private canceled = false;
 
   /**
@@ -151,13 +186,22 @@ export class AgentLoop {
    *    400 | No tool output found for function call …
    *  error from OpenAI. */
   private pendingAborts: Set<string> = new Set();
+  /** Set to true by `terminate()` – prevents any further use of the instance. */
   private terminated = false;
+  /** Master abort controller – fires when terminate() is invoked. */
   private readonly hardAbort = new AbortController();
 
+  /**
+   * Abort the ongoing request/stream, if any. This allows callers (typically
+   * the UI layer) to interrupt the current agent step so the user can issue
+   * new instructions without waiting for the model to finish.
+   */
   public cancel(): void {
     if (this.terminated) {
       return;
     }
+
+    // Reset the current stream to allow new requests
     this.currentStream = null;
     log(
       `AgentLoop.cancel() invoked – currentStream=${Boolean(
@@ -171,11 +215,13 @@ export class AgentLoop {
     )?.controller?.abort?.();
 
     this.canceled = true;
+
+    // Abort any in-progress tool calls
     this.execAbortController?.abort();
+
+    // Create a new abort controller for future tool calls
     this.execAbortController = new AbortController();
-    if (isLoggingEnabled()) {
-      log("AgentLoop.cancel(): execAbortController.abort() called");
-    }
+    log("AgentLoop.cancel(): execAbortController.abort() called");
 
     // NOTE: We intentionally do *not* clear `lastResponseId` here.  If the
     // stream produced a `function_call` before the user cancelled, OpenAI now
@@ -193,28 +239,57 @@ export class AgentLoop {
         /* ignore */
       }
     }
+
     this.onLoading(false);
+
+    /* Inform the UI that the run was aborted by the user. */
+    // const cancelNotice: ResponseItem = {
+    //   id: `cancel-${Date.now()}`,
+    //   type: "message",
+    //   role: "system",
+    //   content: [
+    //     {
+    //       type: "input_text",
+    //       text: "⏹️  Execution canceled by user.",
+    //     },
+    //   ],
+    // };
+    // this.onItem(cancelNotice);
+
     this.generation += 1;
     log(`AgentLoop.cancel(): generation bumped to ${this.generation}`);
   }
 
+  /**
+   * Hard‑stop the agent loop. After calling this method the instance becomes
+   * unusable: any in‑flight operations are aborted and subsequent invocations
+   * of `run()` will throw.
+   */
   public terminate(): void {
     if (this.terminated) {
       return;
     }
     this.terminated = true;
+
     this.hardAbort.abort();
+
     this.cancel();
   }
 
   public sessionId: string;
-
+  /*
+   * Cumulative thinking time across this AgentLoop instance (ms).
+   * Currently not used anywhere – comment out to keep the strict compiler
+   * happy under `noUnusedLocals`.  Restore when telemetry support lands.
+   */
+  // private cumulativeThinkingMs = 0;
   constructor({
     model,
     provider = "openai",
     instructions,
     approvalPolicy,
     disableResponseStorage,
+    graphEnabled = false, // Default to false if not provided
     // `config` used to be required.  Some unit‑tests (and potentially other
     // callers) instantiate `AgentLoop` without passing it, so we make it
     // optional and fall back to sensible defaults.  This keeps the public
@@ -227,7 +302,7 @@ export class AgentLoop {
     getCommandConfirmation,
     onLastResponseId,
     additionalWritableRoots,
-  }: AgentLoopParams) {
+  }: AgentLoopParams & { config?: AppConfig }) {
     this.model = model;
     this.provider = provider;
     this.instructions = instructions;
@@ -249,38 +324,38 @@ export class AgentLoop {
     this.onLastResponseId = onLastResponseId;
 
     this.disableResponseStorage = disableResponseStorage ?? false;
+    this.graphEnabled = graphEnabled; // Store graph status
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
-
-    // --- Graph Mode Initialization ---
-    this.graphMode = config.graphMode ?? false;
-    if (this.graphMode) {
-      const projectRoot = process.cwd();
-      this.graphPath = path.join(projectRoot, ".codex", "dependency_graph.json");
-      this.initializeGraphData().catch((err) => {
-        log(`Error initializing graph data: ${err}`);
-        // Optionally disable graph mode if init fails
-        // this.graphMode = false;
-      });
-    }
-    // --- End Graph Mode Initialization ---
-
+    // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
     const apiKey = getApiKey(this.provider);
     const baseURL = getBaseUrl(this.provider);
 
     this.oai = new OpenAI({
+      // The OpenAI JS SDK only requires `apiKey` when making requests against
+      // the official API.  When running unit‑tests we stub out all network
+      // calls so an undefined key is perfectly fine.  We therefore only set
+      // the property if we actually have a value to avoid triggering runtime
+      // errors inside the SDK (it validates that `apiKey` is a non‑empty
+      // string when the field is present).
       ...(apiKey ? { apiKey } : {}),
       baseURL,
       defaultHeaders: {
         originator: ORIGIN,
         version: CLI_VERSION,
         session_id: this.sessionId,
+        ...(OPENAI_ORGANIZATION
+          ? { "OpenAI-Organization": OPENAI_ORGANIZATION }
+          : {}),
+        ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
       },
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
 
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
+
+    this.hardAbort = new AbortController();
 
     this.hardAbort.signal.addEventListener(
       "abort",
@@ -289,186 +364,154 @@ export class AgentLoop {
     );
   }
 
-  // --- Graph Initialization Helper ---
-  private async initializeGraphData(): Promise<void> {
-    log("Initializing graph data...");
-    this.graphData = await loadGraph(this.graphPath);
-    if (this.graphData) {
-      // this.graphAnnotation = generateGraphMarkdown(this.graphData); // Keep generating annotation if needed elsewhere
-      log("Graph loaded.");
-      // Load all file paths for the updater
-      const ignorePatterns = loadIgnorePatterns();
-      const allFiles = await getProjectFiles(
-        process.cwd(),
-        ignorePatterns,
-      );
-      this.allFilePaths = allFiles.map((f) => f.path);
-      log(`Loaded ${this.allFilePaths.length} file paths for graph updates.`);
-    } else {
-      log("Graph data not found or invalid.");
-      // Graph build should have happened in cli.tsx if file didn't exist
-    }
-  }
-  // --- End Graph Initialization Helper ---
-
-  // --- New getRelatedContext Tool Implementation ---
-  private async toolGetRelatedContext(args: { filename: string }): Promise<Array<RelatedContextResult>> {
-      if (!this.graphMode || !this.graphData) {
-          log("Graph mode disabled or graph not loaded. Cannot get related context.");
-          throw new Error("Graph mode is not enabled or graph data is unavailable.");
-      }
-      if (!args || typeof args.filename !== 'string') {
-          throw new Error("Invalid arguments: filename is required and must be a string.");
-      }
-      log(`Tool call: getRelatedContext for filename: ${args.filename}`);
-      // Pass only the single filename to the retriever
-      return getRelatedContext([args.filename], this.graphData);
-  }
-  // --- End New getRelatedContext Tool Implementation ---
-
-
   private async handleFunctionCall(
-    item: ResponseFunctionToolCallItem,
-    _currentItems: Array<ResponseItem>, // Keep receiving current items, though not used here
+    item: ResponseFunctionToolCall,
   ): Promise<Array<ResponseInputItem>> {
+    // If the agent has been canceled in the meantime we should not perform any
+    // additional work. Returning an empty array ensures that we neither execute
+    // the requested tool call nor enqueue any follow‑up input items. This keeps
+    // the cancellation semantics intuitive for users – once they interrupt a
+    // task no further actions related to that task should be taken.
     if (this.canceled) {
       return [];
     }
+    // ---------------------------------------------------------------------
+    // Normalise the function‑call item into a consistent shape regardless of
+    // whether it originated from the `/responses` or the `/chat/completions`
+    // endpoint – their JSON differs slightly.
+    // ---------------------------------------------------------------------
 
-    // Access name and arguments directly from the item
-    const name: string | undefined = item.name;
-    const rawArguments: string | undefined = item.arguments;
-    const callId: string = (item as { call_id?: string }).call_id ?? (item as { id: string }).id;
+    const isChatStyle =
+      // The chat endpoint nests function details under a `function` key.
+      // We conservatively treat the presence of this field as a signal that
+      // we are dealing with the chat format.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (item as any).function != null;
 
-    const args = parseToolCallArguments(rawArguments ?? "{}");
+    const name: string | undefined = isChatStyle
+      ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (item as any).function?.name
+      : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (item as any).name;
+
+    const rawArguments: string | undefined = isChatStyle
+      ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (item as any).function?.arguments
+      : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (item as any).arguments;
+
+    // The OpenAI "function_call" item may have either `call_id` (responses
+    // endpoint) or `id` (chat endpoint).  Prefer `call_id` if present but fall
+    // back to `id` to remain compatible.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callId: string = (item as any).call_id ?? (item as any).id;
+
     log(
       `handleFunctionCall(): name=${
         name ?? "undefined"
       } callId=${callId} args=${rawArguments}`,
     );
 
-    // Default output item in case of errors or unknown function
     const outputItem: ResponseInputItem.FunctionCallOutput = {
       type: "function_call_output",
+      // `call_id` is mandatory – ensure we never send `undefined` which would
+      // trigger the "No tool output found…" 400 from the API.
       call_id: callId,
-      output: "no function found", // Default message
+      output: "no function found",
     };
+
+    // used to tell model to stop if needed
     const additionalItems: Array<ResponseInputItem> = [];
 
-    try {
-        // --- Tool Dispatching ---
-        if (name === "getRelatedContext") {
-            const args = JSON.parse(rawArguments ?? "{}") as { filename: string };
-            const relatedContextResult = await this.toolGetRelatedContext(args);
-            // Wrap the actual result in the shell output format
-            outputItem.output = JSON.stringify({
-                output: JSON.stringify(relatedContextResult), // Stringify the actual result array
-                metadata: { exit_code: 0, duration_seconds: 0 } // Provide dummy metadata
-            });
-        } else if (name === "container.exec" || name === "shell") {
-            const args = parseToolCallArguments(rawArguments ?? "{}");
-            if (args == null) {
-                outputItem.output = `invalid arguments for ${name}: ${rawArguments}`;
-            } else {
-                const {
-                    outputText,
-                    metadata,
-                    additionalItems: additionalItemsFromExec,
-                } = await handleExecCommand(
-                    args,
-                    this.config,
-                    this.approvalPolicy,
-                    this.additionalWritableRoots,
-                    this.getCommandConfirmation,
-                    this.execAbortController?.signal,
-                );
-                // Shell commands already return the correct format
-                outputItem.output = JSON.stringify({ output: outputText, metadata });
+    // Handle shell command execution
+    if (name === "container.exec" || name === "shell") {
+      const args = parseToolCallArguments(rawArguments ?? "{}");
+      if (args == null) {
+        outputItem.output = `invalid arguments: ${rawArguments}`;
+      } else {
+        const {
+          outputText,
+          metadata,
+          additionalItems: additionalItemsFromExec,
+        } = await handleExecCommand(
+          args,
+          this.config,
+          this.approvalPolicy,
+          this.additionalWritableRoots,
+          this.getCommandConfirmation,
+          this.execAbortController?.signal,
+        );
+        outputItem.output = JSON.stringify({ output: outputText, metadata });
 
-                if (additionalItemsFromExec) {
-                    additionalItems.push(...additionalItemsFromExec);
-                }
-
-                // --- Graph Update Logic (for shell/exec) ---
-                const isApplyPatch = args.cmd[0] === "apply_patch";
-                if (
-                    isApplyPatch &&
-                    this.graphMode &&
-                    this.graphData &&
-                    metadata['exit_code'] === 0 // Use bracket notation
-                ) {
-                    const patchText = args.cmd[1];
-                    if (patchText) {
-                        const parsedOps = parseApplyPatch(patchText);
-                        if (parsedOps) {
-                            const changes: Array<ChangedFile> = parsedOps.map((op) => ({
-                                path: op.path,
-                                changeType: op.type as "create" | "update" | "delete", // Cast type
-                            }));
-                            log(`Triggering graph update for ${changes.length} changes from apply_patch.`);
-                            try {
-                                // eslint-disable-next-line no-await-in-loop
-                                const updatedGraph = await updateGraphForChanges(
-                                    changes,
-                                    this.graphData,
-                                    this.model,
-                                    this.config.apiKey ?? "",
-                                    this.allFilePaths,
-                                );
-                                this.graphData = updatedGraph;
-                                // this.graphAnnotation = generateGraphMarkdown(this.graphData); // Regenerate if needed
-                                // eslint-disable-next-line no-await-in-loop
-                                await saveGraph(this.graphPath, this.graphData);
-                                log("Graph updated and saved successfully after apply_patch.");
-                            } catch (error) {
-                                log(`Error updating graph after apply_patch: ${error}`);
-                            }
-                        } else {
-                            log("Could not parse patch text for graph update.");
-                        }
-                    } else {
-                        log("Patch text not found in apply_patch command for graph update.");
-                    }
-                }
-                // --- End Graph Update Logic ---
-            }
-        } else {
-            log(`Unknown function call name: ${name}`);
-            // Wrap unknown function output as well for safety, though ideally model shouldn't call unknown functions
-             outputItem.output = JSON.stringify({
-                output: `Unknown function name: ${name}`,
-                metadata: { exit_code: 1, duration_seconds: 0 }
-            });
+        if (additionalItemsFromExec) {
+          additionalItems.push(...additionalItemsFromExec);
         }
-        // --- End Tool Dispatching ---
-
-    } catch (error) {
-        log(`Error handling function call ${name}: ${error}`);
-        // Format error output consistently
+      }
+    }
+    // Handle graph tool execution
+    else if (name === "graph_tool") {
+      try {
+        const parsedArgs = graphToolSchema.parse(
+          JSON.parse(rawArguments ?? "{}"),
+        );
+        log(`Graph tool called with query: "${parsedArgs.query}"`);
+        // Call getGraphContext, passing the config object
+        const graphContext = await getGraphContext(
+          process.cwd(),
+          [], // Seeds are now determined by LLM inside getContext
+          parsedArgs.query, // Pass the query
+          maxTokensForModel(this.model) * 0.5, // Example budget
+          this.config, // Pass the AppConfig
+        );
+        // Log the full graph context for debugging
+        log(`Graph tool raw output:\n${graphContext}`);
         outputItem.output = JSON.stringify({
-            output: `Error executing tool ${name}: ${error instanceof Error ? error.message : String(error)}`,
-            metadata: { exit_code: 1, duration_seconds: 0 }
+          output: graphContext || "No relevant graph context found.",
+          metadata: {},
         });
+        log(`Graph tool returned context (length: ${graphContext.length})`);
+      } catch (error) {
+        log(`Error parsing graph_tool arguments or retrieving context: ${error}`);
+        outputItem.output = JSON.stringify({
+          output: `Error processing graph tool request: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          metadata: { error: true },
+        });
+      }
     }
 
     return [outputItem, ...additionalItems];
   }
 
-
   public async run(
     input: Array<ResponseInputItem>,
     previousResponseId: string = "",
-    currentItems: Array<ResponseItem> = [], // Receive current items
   ): Promise<void> {
+    // ---------------------------------------------------------------------
+    // Top‑level error wrapper so that known transient network issues like
+    // `ERR_STREAM_PREMATURE_CLOSE` do not crash the entire CLI process.
+    // Instead we surface the failure to the user as a regular system‑message
+    // and terminate the current run gracefully. The calling UI can then let
+    // the user retry the request if desired.
+    // ---------------------------------------------------------------------
+
     try {
       if (this.terminated) {
         throw new Error("AgentLoop has been terminated");
       }
+      // Record when we start "thinking" so we can report accurate elapsed time.
       const thinkingStart = Date.now();
+      // Bump generation so that any late events from previous runs can be
+      // identified and dropped.
       const thisGeneration = ++this.generation;
 
+      // Reset cancellation flag and stream for a fresh run.
       this.canceled = false;
       this.currentStream = null;
+
+      // Create a fresh AbortController for this run so that tool calls from a
+      // previous run do not accidentally get signalled.
       this.execAbortController = new AbortController();
       log(
         `AgentLoop.run(): new execAbortController created (${this.execAbortController.signal}) for generation ${this.generation}`,
@@ -508,6 +551,7 @@ export class AgentLoop {
             }),
           } as ResponseInputItem.FunctionCallOutput);
         }
+        // Once converted the pending list can be cleared.
         this.pendingAborts.clear();
       }
 
@@ -565,10 +609,26 @@ export class AgentLoop {
 
       const staged: Array<ResponseItem | undefined> = [];
       const stageItem = (item: ResponseItem) => {
+        // Ignore any stray events that belong to older generations.
         if (thisGeneration !== this.generation) {
           return;
         }
+
+        // Store the item so the final flush can still operate on a complete list.
+        // We'll nil out entries once they're delivered.
         const idx = staged.push(item) - 1;
+
+        // Instead of emitting synchronously we schedule a short‑delay delivery.
+        //
+        // This accomplishes two things:
+        //   1. The UI still sees new messages almost immediately, creating the
+        //      perception of real‑time updates.
+        //   2. If the user calls `cancel()` in the small window right after the
+        //      item was staged we can still abort the delivery because the
+        //      generation counter will have been bumped by `cancel()`.
+        //
+        // Use a minimal 3ms delay for terminal rendering to maintain readable
+        // streaming.
         setTimeout(() => {
           if (
             thisGeneration === this.generation &&
@@ -576,10 +636,12 @@ export class AgentLoop {
             !this.hardAbort.signal.aborted
           ) {
             this.onItem(item);
+            // Mark as delivered so flush won't re-emit it
             staged[idx] = undefined;
 
-            // When we operate without server‑side storage we keep our own
-            // transcript so we can provide full context on subsequent calls.
+            // Handle transcript updates to maintain consistency. When we
+            // operate without server‑side storage we keep our own transcript
+            // so we can provide full context on subsequent calls.
             if (this.disableResponseStorage) {
               // Exclude system messages from transcript as they do not form
               // part of the assistant/user dialogue that the model needs.
@@ -623,12 +685,10 @@ export class AgentLoop {
               }
             }
           }
-        }, 10);
+        }, 3); // Small 3ms delay for readable streaming.
       };
 
-      let currentTurnInput = turnInput; // Use a mutable variable for the loop
-
-      while (currentTurnInput.length > 0) {
+      while (turnInput.length > 0) {
         if (this.canceled || this.hardAbort.signal.aborted) {
           this.onLoading(false);
           return;
@@ -652,8 +712,10 @@ export class AgentLoop {
         for (const item of deltaInput) {
           stageItem(item as ResponseItem);
         }
-
+        // Send request to OpenAI with retry on timeout.
         let stream;
+
+        // Retry loop for transient errors. Up to MAX_RETRIES attempts.
         const MAX_RETRIES = 5;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
@@ -661,22 +723,10 @@ export class AgentLoop {
             if (this.model.startsWith("o")) {
               reasoning = { effort: "high" };
               if (this.model === "o3" || this.model === "o4-mini") {
-                // @ts-expect-error waiting for API type update
                 reasoning.summary = "auto";
               }
             }
-
-            // --- Keep Graph Annotation Injection (Optional) ---
-            // Decide if you still want the static graph overview in the system prompt
-            const baseInstructions = this.instructions ?? ""; // Use const
-            // Example: Conditionally add graph annotation if desired
-            // if (this.graphMode && this.graphAnnotation) {
-            //   baseInstructions = `${this.graphAnnotation}\n\n---\n\n${baseInstructions}`;
-            //   log("Prepended graph annotation to instructions.");
-            // }
-            // --- End Graph Annotation Injection ---
-
-            const mergedInstructions = [prefix, baseInstructions]
+            const mergedInstructions = [prefix, this.instructions]
               .filter(Boolean)
               .join("\n");
 
@@ -694,6 +744,9 @@ export class AgentLoop {
               `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
             );
 
+            // Conditionally add graphTool based on graphEnabled flag
+            const tools = this.graphEnabled ? [shellTool, graphTool] : [shellTool];
+
             // eslint-disable-next-line no-await-in-loop
             stream = await responseCall({
               model: this.model,
@@ -709,28 +762,32 @@ export class AgentLoop {
                     store: true,
                     previous_response_id: lastResponseId || undefined,
                   }),
-              tools: [shellTool],
+              tools: tools, // Use the conditionally defined tools array
               // Explicitly tell the model it is allowed to pick whatever
               // tool it deems appropriate.  Omitting this sometimes leads to
               // the model ignoring the available tools and responding with
               // plain text instead (resulting in a missing tool‑call).
               tool_choice: "auto",
             });
-            break; // Success, exit retry loop
+            break;
           } catch (error) {
-            // ... (existing error handling logic remains the same) ...
             const isTimeout = error instanceof APIConnectionTimeoutError;
-            const ApiConnErrCtor = (OpenAI as typeof OpenAI).APIConnectionError as
-              | (new (...args: Array<unknown>) => Error)
+            // Lazily look up the APIConnectionError class at runtime to
+            // accommodate the test environment's minimal OpenAI mocks which
+            // do not define the class.  Falling back to `false` when the
+            // export is absent ensures the check never throws.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ApiConnErrCtor = (OpenAI as any).APIConnectionError as  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              | (new (...args: any) => Error)
               | undefined;
             const isConnectionError = ApiConnErrCtor
               ? error instanceof ApiConnErrCtor
               : false;
-            const errCtx = error as Record<string, unknown>;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const errCtx = error as any;
             const status =
-              errCtx['status'] ?? errCtx['httpStatus'] ?? errCtx['statusCode'];
-            const isServerError =
-              typeof status === "number" && status >= 500;
+              errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
+            const isServerError = typeof status === "number" && status >= 500;
             if (
               (isTimeout || isServerError || isConnectionError) &&
               attempt < MAX_RETRIES
@@ -738,16 +795,14 @@ export class AgentLoop {
               log(
                 `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
               );
-              // eslint-disable-next-line no-await-in-loop
-              await new Promise((resolve) => setTimeout(resolve, 1000 * attempt)); // Simple backoff
               continue;
             }
 
             const isTooManyTokensError =
-              (errCtx['param'] === "max_tokens" ||
-                (typeof errCtx['message'] === "string" &&
-                  /max_tokens is too large/i.test(errCtx['message']))) &&
-              errCtx['type'] === "invalid_request_error";
+              (errCtx.param === "max_tokens" ||
+                (typeof errCtx.message === "string" &&
+                  /max_tokens is too large/i.test(errCtx.message))) &&
+              errCtx.type === "invalid_request_error";
 
             if (isTooManyTokensError) {
               this.onItem({
@@ -767,13 +822,17 @@ export class AgentLoop {
 
             const isRateLimit =
               status === 429 ||
-              errCtx['code'] === "rate_limit_exceeded" ||
-              errCtx['type'] === "rate_limit_exceeded" ||
-              /rate limit/i.test((errCtx['message'] as string) ?? "");
+              errCtx.code === "rate_limit_exceeded" ||
+              errCtx.type === "rate_limit_exceeded" ||
+              /rate limit/i.test(errCtx.message ?? "");
             if (isRateLimit) {
               if (attempt < MAX_RETRIES) {
+                // Exponential backoff: base wait * 2^(attempt-1), or use suggested retry time
+                // if provided.
                 let delayMs = RATE_LIMIT_RETRY_WAIT_MS * 2 ** (attempt - 1);
-                const msg = (errCtx['message'] as string) ?? "";
+
+                // Parse suggested retry time from error message, e.g., "Please try again in 1.3s"
+                const msg = errCtx?.message ?? "";
                 const m = /(?:retry|try) again in ([\d.]+)s/i.exec(msg);
                 if (m && m[1]) {
                   const suggested = parseFloat(m[1]) * 1000;
@@ -790,12 +849,17 @@ export class AgentLoop {
                 await new Promise((resolve) => setTimeout(resolve, delayMs));
                 continue;
               } else {
+                // We have exhausted all retry attempts. Surface a message so the user understands
+                // why the request failed and can decide how to proceed (e.g. wait and retry later
+                // or switch to a different model / account).
+
                 const errorDetails = [
                   `Status: ${status || "unknown"}`,
-                  `Code: ${errCtx['code'] || "unknown"}`,
-                  `Type: ${errCtx['type'] || "unknown"}`,
-                  `Message: ${errCtx['message'] || "unknown"}`,
+                  `Code: ${errCtx.code || "unknown"}`,
+                  `Type: ${errCtx.type || "unknown"}`,
+                  `Message: ${errCtx.message || "unknown"}`,
                 ].join(", ");
+
                 this.onItem({
                   id: `error-${Date.now()}`,
                   type: "message",
@@ -807,6 +871,7 @@ export class AgentLoop {
                     },
                   ],
                 });
+
                 this.onLoading(false);
                 return;
               }
@@ -817,8 +882,8 @@ export class AgentLoop {
                 status >= 400 &&
                 status < 500 &&
                 status !== 429) ||
-              errCtx['code'] === "invalid_request_error" ||
-              errCtx['type'] === "invalid_request_error";
+              errCtx.code === "invalid_request_error" ||
+              errCtx.type === "invalid_request_error";
             if (isClientError) {
               this.onItem({
                 id: `error-${Date.now()}`,
@@ -827,6 +892,8 @@ export class AgentLoop {
                 content: [
                   {
                     type: "input_text",
+                    // Surface the request ID when it is present on the error so users
+                    // can reference it when contacting support or inspecting logs.
                     text: (() => {
                       const reqId =
                         (
@@ -841,12 +908,14 @@ export class AgentLoop {
                             requestId?: string;
                           }>
                         )?.requestId;
+
                       const errorDetails = [
                         `Status: ${status || "unknown"}`,
-                        `Code: ${errCtx['code'] || "unknown"}`,
-                        `Type: ${errCtx['type'] || "unknown"}`,
-                        `Message: ${errCtx['message'] || "unknown"}`,
+                        `Code: ${errCtx.code || "unknown"}`,
+                        `Type: ${errCtx.type || "unknown"}`,
+                        `Message: ${errCtx.message || "unknown"}`,
                       ].join(", ");
+
                       return `⚠️  OpenAI rejected the request${
                         reqId ? ` (request ID: ${reqId})` : ""
                       }. Error details: ${errorDetails}. Please verify your settings and try again.`;
@@ -857,11 +926,14 @@ export class AgentLoop {
               this.onLoading(false);
               return;
             }
-            throw error; // Re-throw unhandled errors
+            throw error;
           }
         }
 
+        // If the user requested cancellation while we were awaiting the network
+        // request, abort immediately before we start handling the stream.
         if (this.canceled || this.hardAbort.signal.aborted) {
+          // `stream` is defined; abort to avoid wasting tokens/server work
           try {
             (
               stream as { controller?: { abort?: () => void } }
@@ -873,11 +945,13 @@ export class AgentLoop {
           return;
         }
 
+        // Keep track of the active stream so it can be aborted on demand.
         this.currentStream = stream;
 
+        // Guard against an undefined stream before iterating.
         if (!stream) {
           this.onLoading(false);
-          log("AgentLoop.run(): stream is undefined after retries");
+          log("AgentLoop.run(): stream is undefined");
           return;
         }
 
@@ -1049,6 +1123,8 @@ export class AgentLoop {
                 "agentLoop.run(): responseCall(1): turnInput: " +
                   JSON.stringify(turnInput),
               );
+              // Conditionally add graphTool based on graphEnabled flag
+              const tools = this.graphEnabled ? [shellTool, graphTool] : [shellTool];
               // eslint-disable-next-line no-await-in-loop
               stream = await responseCall({
                 model: this.model,
@@ -1064,7 +1140,7 @@ export class AgentLoop {
                       store: true,
                       previous_response_id: lastResponseId || undefined,
                     }),
-                tools: [shellTool],
+                tools: tools, // Use the conditionally defined tools array
                 tool_choice: "auto",
               });
 
@@ -1125,35 +1201,97 @@ export class AgentLoop {
         } // end while retry loop
 
         log(
-          `Next turn inputs (${currentTurnInput.length}) - ${currentTurnInput
+          `Turn inputs (${turnInput.length}) - ${turnInput
             .map((i) => i.type)
             .join(", ")}`,
         );
-      } // End while(currentTurnInput.length > 0)
+      }
 
+      // Flush staged items if the run concluded successfully (i.e. the user did
+      // not invoke cancel() or terminate() during the turn).
       const flush = () => {
         if (
           !this.canceled &&
           !this.hardAbort.signal.aborted &&
           thisGeneration === this.generation
         ) {
+          // Only emit items that weren't already delivered above
           for (const item of staged) {
             if (item) {
               this.onItem(item);
             }
           }
         }
+
+        // At this point the turn finished without the user invoking
+        // `cancel()`.  Any outstanding function‑calls must therefore have been
+        // satisfied, so we can safely clear the set that tracks pending aborts
+        // to avoid emitting duplicate synthetic outputs in subsequent runs.
         this.pendingAborts.clear();
+        // Now emit system messages recording the per‑turn *and* cumulative
+        // thinking times so UIs and tests can surface/verify them.
+        // const thinkingEnd = Date.now();
+
+        // 1) Per‑turn measurement – exact time spent between request and
+        //    response for *this* command.
+        // this.onItem({
+        //   id: `thinking-${thinkingEnd}`,
+        //   type: "message",
+        //   role: "system",
+        //   content: [
+        //     {
+        //       type: "input_text",
+        //       text: `🤔  Thinking time: ${Math.round(
+        //         (thinkingEnd - thinkingStart) / 1000
+        //       )} s`,
+        //     },
+        //   ],
+        // });
+
+        // 2) Session‑wide cumulative counter so users can track overall wait
+        //    time across multiple turns.
+        // this.cumulativeThinkingMs += thinkingEnd - thinkingStart;
+        // this.onItem({
+        //   id: `thinking-total-${thinkingEnd}`,
+        //   type: "message",
+        //   role: "system",
+        //   content: [
+        //     {
+        //       type: "input_text",
+        //       text: `⏱  Total thinking time: ${Math.round(
+        //         this.cumulativeThinkingMs / 1000
+        //       )} s`,
+        //     },
+        //   ],
+        // });
+
         this.onLoading(false);
       };
 
-      setTimeout(flush, 30);
+      // Use a small delay to make sure UI rendering is smooth. Double-check
+      // cancellation state right before flushing to avoid race conditions.
+      setTimeout(() => {
+        if (
+          !this.canceled &&
+          !this.hardAbort.signal.aborted &&
+          thisGeneration === this.generation
+        ) {
+          flush();
+        }
+      }, 3);
+
+      // End of main logic. The corresponding catch block for the wrapper at the
+      // start of this method follows next.
     } catch (err) {
-      // ... (existing outer error handling logic) ...
+      // Handle known transient network/streaming issues so they do not crash the
+      // CLI. We currently match Node/undici's `ERR_STREAM_PREMATURE_CLOSE`
+      // error which manifests when the HTTP/2 stream terminates unexpectedly
+      // (e.g. during brief network hiccups).
+
       const isPrematureClose =
         err instanceof Error &&
         // eslint-disable-next-line
-        ((err as unknown as Record<string, unknown>)['code'] === "ERR_STREAM_PREMATURE_CLOSE" ||
+        ((err as any).code === "ERR_STREAM_PREMATURE_CLOSE" ||
           err.message?.includes("Premature close"));
 
       if (isPrematureClose) {
@@ -1176,6 +1314,21 @@ export class AgentLoop {
         return;
       }
 
+      // -------------------------------------------------------------------
+      // Catch‑all handling for other network or server‑side issues so that
+      // transient failures do not crash the CLI. We intentionally keep the
+      // detection logic conservative to avoid masking programming errors. A
+      // failure is treated as retry‑worthy/user‑visible when any of the
+      // following apply:
+      //   • the error carries a recognised Node.js network errno ‑ style code
+      //     (e.g. ECONNRESET, ETIMEDOUT …)
+      //   • the OpenAI SDK attached an HTTP `status` >= 500 indicating a
+      //     server‑side problem.
+      //   • the error is model specific and detected in stream.
+      // If matched we emit a single system message to inform the user and
+      // resolve gracefully so callers can choose to retry.
+      // -------------------------------------------------------------------
+
       const NETWORK_ERRNOS = new Set([
         "ECONNRESET",
         "ECONNREFUSED",
@@ -1189,32 +1342,46 @@ export class AgentLoop {
         if (!err || typeof err !== "object") {
           return false;
         }
-        const e = err as unknown as Record<string, unknown>;
-        const ApiConnErrCtor = (OpenAI as typeof OpenAI).APIConnectionError as
-          | (new (...args: Array<unknown>) => Error)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const e: any = err;
+
+        // Direct instance check for connection errors thrown by the OpenAI SDK.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ApiConnErrCtor = (OpenAI as any).APIConnectionError as  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          | (new (...args: any) => Error)
           | undefined;
         if (ApiConnErrCtor && e instanceof ApiConnErrCtor) {
           return true;
         }
-        if (typeof e['code'] === "string" && NETWORK_ERRNOS.has(e['code'])) {
+
+        if (typeof e.code === "string" && NETWORK_ERRNOS.has(e.code)) {
           return true;
         }
+
+        // When the OpenAI SDK nests the underlying network failure inside the
+        // `cause` property we surface it as well so callers do not see an
+        // unhandled exception for errors like ENOTFOUND, ECONNRESET …
         if (
-          e['cause'] &&
-          typeof e['cause'] === "object" &&
-          NETWORK_ERRNOS.has((e['cause'] as { code?: string }).code ?? "")
+          e.cause &&
+          typeof e.cause === "object" &&
+          NETWORK_ERRNOS.has((e.cause as { code?: string }).code ?? "")
         ) {
           return true;
         }
-        if (typeof e['status'] === "number" && e['status'] >= 500) {
+
+        if (typeof e.status === "number" && e.status >= 500) {
           return true;
         }
+
+        // Fallback to a heuristic string match so we still catch future SDK
+        // variations without enumerating every errno.
         if (
-          typeof e['message'] === "string" &&
-          /network|socket|stream/i.test(e['message'])
+          typeof e.message === "string" &&
+          /network|socket|stream/i.test(e.message)
         ) {
           return true;
         }
+
         return false;
       })();
 
@@ -1244,43 +1411,52 @@ export class AgentLoop {
         if (!err || typeof err !== "object") {
           return false;
         }
-        const e = err as unknown as Record<string, unknown>;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const e: any = err;
+
         if (
-          e['type'] === "invalid_request_error" &&
-          e['code'] === "model_not_found"
+          e.type === "invalid_request_error" &&
+          e.code === "model_not_found"
         ) {
           return true;
         }
+
         if (
-          e['cause'] &&
-          (e['cause'] as Record<string, unknown>)['type'] === "invalid_request_error" &&
-          (e['cause'] as Record<string, unknown>)['code'] === "model_not_found"
+          e.cause &&
+          e.cause.type === "invalid_request_error" &&
+          e.cause.code === "model_not_found"
         ) {
           return true;
         }
+
         return false;
       };
 
       if (isInvalidRequestError()) {
         try {
-          const e = err as unknown as Record<string, unknown>;
+          // Extract request ID and error details from the error object
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const e: any = err;
+
           const reqId =
-            e['request_id'] ??
-            (e['cause'] && (e['cause'] as Record<string, unknown>)['request_id']) ??
-            (e['cause'] && (e['cause'] as Record<string, unknown>)['requestId']);
+            e.request_id ??
+            (e.cause && e.cause.request_id) ??
+            (e.cause && e.cause.requestId);
+
           const errorDetails = [
-            `Status: ${
-              e['status'] || (e['cause'] && (e['cause'] as Record<string, unknown>)['status']) || "unknown"
-            }`,
-            `Code: ${e['code'] || (e['cause'] && (e['cause'] as Record<string, unknown>)['code']) || "unknown"}`,
-            `Type: ${e['type'] || (e['cause'] && (e['cause'] as Record<string, unknown>)['type']) || "unknown"}`,
+            `Status: ${e.status || (e.cause && e.cause.status) || "unknown"}`,
+            `Code: ${e.code || (e.cause && e.cause.code) || "unknown"}`,
+            `Type: ${e.type || (e.cause && e.cause.type) || "unknown"}`,
             `Message: ${
-              e['message'] || (e['cause'] && (e['cause'] as Record<string, unknown>)['message']) || "unknown"
+              e.message || (e.cause && e.cause.message) || "unknown"
             }`,
           ].join(", ");
+
           const msgText = `⚠️  OpenAI rejected the request${
             reqId ? ` (request ID: ${reqId})` : ""
           }. Error details: ${errorDetails}. Please verify your settings and try again.`;
+
           this.onItem({
             id: `error-${Date.now()}`,
             type: "message",
@@ -1293,37 +1469,38 @@ export class AgentLoop {
             ],
           });
         } catch {
-          /* best-effort */
+          /* best‑effort */
         }
         this.onLoading(false);
         return;
       }
 
-      throw err; // Re-throw unhandled errors
+      // Re‑throw all other errors so upstream handlers can decide what to do.
+      throw err;
     }
   }
 
+  // we need until we can depend on streaming events
   private async processEventsWithoutStreaming(
     output: Array<ResponseInputItem>,
     emitItem: (item: ResponseItem) => void,
-    currentItems: Array<ResponseItem>, // Receive current items
   ): Promise<Array<ResponseInputItem>> {
+    // If the agent has been canceled we should short‑circuit immediately to
+    // avoid any further processing (including potentially expensive tool
+    // calls). Returning an empty array ensures the main run‑loop terminates
+    // promptly.
     if (this.canceled) {
       return [];
     }
     const turnInput: Array<ResponseInputItem> = [];
     for (const item of output) {
       if (item.type === "function_call") {
-        // Ensure item has an id before checking the set
-        const itemId = (item as { id?: string }).id;
-        if (itemId && alreadyProcessedResponses.has(itemId)) {
+        if (alreadyProcessedResponses.has(item.id)) {
           continue;
         }
-        if (itemId) {
-            alreadyProcessedResponses.add(itemId);
-        }
+        alreadyProcessedResponses.add(item.id);
         // eslint-disable-next-line no-await-in-loop
-        const result = await this.handleFunctionCall(item as ResponseFunctionToolCallItem, currentItems); // Pass current items
+        const result = await this.handleFunctionCall(item);
         turnInput.push(...result);
       }
       emitItem(item as ResponseItem);
@@ -1332,22 +1509,11 @@ export class AgentLoop {
   }
 }
 
-// Removed unused helper function extractFilePaths
-
-// Helper to get project files (adapt from singlepass or create new)
-async function getProjectFiles(
-  projectRoot: string,
-  ignorePatterns: Array<RegExp>,
-): Promise<Array<FileContent>> {
-  // Implementation reused or adapted from src/utils/singlepass/context_files.ts
-  return getFileContents(projectRoot, ignorePatterns);
-}
-
 const prefix = `You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
 
 You can:
 - Receive user prompts, project context, and files.
-- Stream responses and emit function calls (e.g., shell commands, code edits, context retrieval).
+- Stream responses and emit function calls (e.g., shell commands, code edits, graph queries).
 - Apply patches, run commands, and manage user approvals based on policy.
 - Work inside a sandboxed, git-backed workspace with rollback support.
 - Log telemetry so sessions can be replayed or inspected later.
@@ -1355,7 +1521,11 @@ You can:
 
 The Codex CLI is open-sourced. Don't confuse yourself with the old Codex language model built by OpenAI many moons ago (this is understandably top of mind for you!). Within this context, Codex refers to the open-source agentic coding interface.
 
-You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools (like \`getRelatedContext\` or \`shell\` with commands like \`cat\`, \`ls\`, \`grep\`) to read files and gather the relevant information: do NOT guess or make up an answer.
+You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
+
+**Available Tools:**
+- \`shell\`: Executes shell commands. Use this for tasks like running builds, tests, or interacting with version control.
+- \`graph_tool\`: Queries the codebase graph for context. Use this tool BEFORE making changes to understand code relationships, identify potential impacts (callers/callees), or gather context about specific functions or files. Example queries: "Find callers of function X", "What does function Y do?", "Show context for file Z".
 
 Please resolve the user's task by editing and testing the code files in your current code execution session. You are a deployed coding agent. Your session allows for you to modify and run code. The repo(s) are already cloned in your working directory, and you must fully solve the problem for your answer to be considered correct.
 
@@ -1364,8 +1534,9 @@ You MUST adhere to the following criteria when executing the task:
 - Analyzing code for vulnerabilities is allowed.
 - Showing user code and tool call details is allowed.
 - User instructions may overwrite the *CODING GUIDELINES* section in this developer message.
-- Use \`apply_patch\` via the \`shell\` tool to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
+- Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
 - If completing the user's task requires writing or modifying files:
+    - **Use the \`graph_tool\` first** to understand the context and potential impact of your changes.
     - Your code and final answer should follow these *CODING GUIDELINES*:
         - Fix the problem at the root cause rather than applying surface-level patches, when possible.
         - Avoid unneeded complexity in your solution.

@@ -50,7 +50,8 @@
     "strip-ansi": "^7.1.0",
     "to-rotated": "^1.0.0",
     "use-interval": "1.4.0",
-    "zod": "^3.24.3"
+    "zod": "^3.24.3",
+    "zod-to-json-schema": "^3.23.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",
@@ -71,7 +72,7 @@
     "eslint-plugin-react-refresh": "^0.4.19",
     "husky": "^9.1.7",
     "ink-testing-library": "^3.0.0",
-    "prettier": "^2.8.7",
+    "prettier": "^3.5.3",
     "punycode": "^2.3.1",
     "semver": "^7.7.1",
     "ts-node": "^10.9.1",

@@ -55,6 +55,7 @@ export default function TerminalChatInput({
   onCompact,
   interruptAgent,
   active,
+  thinkingSeconds,
   items = [],
 }: {
   isNew: boolean;
@@ -77,6 +78,7 @@ export default function TerminalChatInput({
   onCompact: () => void;
   interruptAgent: () => void;
   active: boolean;
+  thinkingSeconds: number;
   // New: current conversation items so we can include them in bug reports
   items?: Array<ResponseItem>;
 }): React.ReactElement {
@@ -133,8 +135,8 @@ export default function TerminalChatInput({
                 ? len - 1
                 : selectedSlashSuggestion - 1
               : selectedSlashSuggestion >= len - 1
-              ? 0
-              : selectedSlashSuggestion + 1;
+                ? 0
+                : selectedSlashSuggestion + 1;
             setSelectedSlashSuggestion(nextIdx);
             // Autocomplete the command in the input
             const match = matches[nextIdx];
@@ -243,30 +245,40 @@ export default function TerminalChatInput({
         }
 
         if (_key.upArrow) {
-          // Only recall history when the caret was *already* on the very first
+          let moveThroughHistory = true;
+
+          // Only use history when the caret was *already* on the very first
           // row *before* this key-press.
           const cursorRow = editorRef.current?.getRow?.() ?? 0;
           const wasAtFirstRow = (prevCursorRow.current ?? cursorRow) === 0;
+          if (!(cursorRow === 0 && wasAtFirstRow)) {
+            moveThroughHistory = false;
+          }
 
-          if (history.length > 0 && cursorRow === 0 && wasAtFirstRow) {
+          // Only use history if we are already in history mode or if the input is empty.
+          if (historyIndex == null && input.trim() !== "") {
+            moveThroughHistory = false;
+          }
+
+          // Move through history.
+          if (history.length && moveThroughHistory) {
+            let newIndex: number;
             if (historyIndex == null) {
               const currentDraft = editorRef.current?.getText?.() ?? input;
               setDraftInput(currentDraft);
-            }
-
-            let newIndex: number;
-            if (historyIndex == null) {
               newIndex = history.length - 1;
             } else {
               newIndex = Math.max(0, historyIndex - 1);
             }
             setHistoryIndex(newIndex);
+
             setInput(history[newIndex]?.command ?? "");
             // Re-mount the editor so it picks up the new initialText
             setEditorKey((k) => k + 1);
-            return; // we handled the key
+            return; // handled
           }
-          // Otherwise let the event propagate so the editor moves the caret
+
+          // Otherwise let it propagate.
         }
 
         if (_key.downArrow) {
@@ -337,73 +349,60 @@ export default function TerminalChatInput({
   const onSubmit = useCallback(
     async (value: string) => {
       const inputValue = value.trim();
-      // If the user only entered a slash, do not send a chat message
+
+      // If the user only entered a slash, do not send a chat message.
       if (inputValue === "/") {
         setInput("");
         return;
       }
-      // Skip this submit if we just autocompleted a slash command
+
+      // Skip this submit if we just autocompleted a slash command.
       if (skipNextSubmit) {
         setSkipNextSubmit(false);
         return;
       }
+
       if (!inputValue) {
         return;
-      }
-
-      if (inputValue === "/history") {
+      } else if (inputValue === "/history") {
         setInput("");
         openOverlay();
         return;
-      }
-
-      if (inputValue === "/help") {
+      } else if (inputValue === "/help") {
         setInput("");
         openHelpOverlay();
         return;
-      }
-
-      if (inputValue === "/diff") {
+      } else if (inputValue === "/diff") {
         setInput("");
         openDiffOverlay();
         return;
-      }
-
-      if (inputValue === "/compact") {
+      } else if (inputValue === "/compact") {
         setInput("");
         onCompact();
         return;
-      }
-
-      if (inputValue.startsWith("/model")) {
+      } else if (inputValue.startsWith("/model")) {
         setInput("");
         openModelOverlay();
         return;
-      }
-
-      if (inputValue.startsWith("/approval")) {
+      } else if (inputValue.startsWith("/approval")) {
         setInput("");
         openApprovalOverlay();
         return;
-      }
-
-      if (inputValue === "q" || inputValue === ":q" || inputValue === "exit") {
+      } else if (inputValue === "exit") {
         setInput("");
-        // wait one 60ms frame
         setTimeout(() => {
           app.exit();
           onExit();
           process.exit(0);
-        }, 60);
+        }, 60); // Wait one frame.
         return;
       } else if (inputValue === "/clear" || inputValue === "clear") {
         setInput("");
         setSessionId("");
         setLastResponseId("");
-        // Clear the terminal screen (including scrollback) before resetting context
-        clearTerminal();
 
-        // Emit a system notice in the chat; no raw console writes so Ink keeps control.
+        // Clear the terminal screen (including scrollback) before resetting context.
+        clearTerminal();
 
         // Emit a system message to confirm the clear action.  We *append*
         // it so Ink's <Static> treats it as new output and actually renders it.
@@ -447,7 +446,7 @@ export default function TerminalChatInput({
             await clearCommandHistory();
             setHistory([]);
 
-            // Emit a system message to confirm the history clear action
+            // Emit a system message to confirm the history clear action.
             setItems((prev) => [
               ...prev,
               {
@@ -464,7 +463,7 @@ export default function TerminalChatInput({
 
         return;
       } else if (inputValue === "/bug") {
-        // Generate a GitHub bug report URL pre‑filled with session details
+        // Generate a GitHub bug report URL pre‑filled with session details.
         setInput("");
 
         try {
@@ -478,7 +477,9 @@ export default function TerminalChatInput({
             items: items ?? [],
             cliVersion: CLI_VERSION,
             model: loadConfig().model ?? "unknown",
-            platform: `${os.platform()} ${os.arch()} ${os.release()}`,
+            platform: [os.platform(), os.arch(), os.release()]
+              .map((s) => `\`${s}\``)
+              .join(" | "),
           });
 
           setItems((prev) => [
@@ -515,10 +516,10 @@ export default function TerminalChatInput({
 
         return;
       } else if (inputValue.startsWith("/")) {
-        // Handle invalid/unrecognized commands.
-        // Only single-word inputs starting with '/' (e.g., /command) that are not recognized are caught here.
-        // Any other input, including those starting with '/' but containing spaces
-        // (e.g., "/command arg"), will fall through and be treated as a regular prompt.
+        // Handle invalid/unrecognized commands. Only single-word inputs starting with '/'
+        // (e.g., /command) that are not recognized are caught here. Any other input, including
+        // those starting with '/' but containing spaces (e.g., "/command arg"), will fall through
+        // and be treated as a regular prompt.
         const trimmed = inputValue.trim();
 
         if (/^\/\S+$/.test(trimmed)) {
@@ -545,11 +546,13 @@ export default function TerminalChatInput({
       // detect image file paths for dynamic inclusion
       const images: Array<string> = [];
       let text = inputValue;
+
       // markdown-style image syntax: ![alt](path)
       text = text.replace(/!\[[^\]]*?\]\(([^)]+)\)/g, (_m, p1: string) => {
         images.push(p1.startsWith("file://") ? fileURLToPath(p1) : p1);
         return "";
       });
+
       // quoted file paths ending with common image extensions (e.g. '/path/to/img.png')
       text = text.replace(
         /['"]([^'"]+?\.(?:png|jpe?g|gif|bmp|webp|svg))['"]/gi,
@@ -558,6 +561,7 @@ export default function TerminalChatInput({
           return "";
         },
       );
+
       // bare file paths ending with common image extensions
       text = text.replace(
         // eslint-disable-next-line no-useless-escape
@@ -574,10 +578,10 @@ export default function TerminalChatInput({
       const inputItem = await createInputItem(text, images);
       submitInput([inputItem]);
 
-      // Get config for history persistence
+      // Get config for history persistence.
       const config = loadConfig();
 
-      // Add to history and update state
+      // Add to history and update state.
       const updatedHistory = await addToHistory(value, history, {
         maxSize: config.history?.maxSize ?? 1000,
         saveHistory: config.history?.saveHistory ?? true,
@@ -633,6 +637,7 @@ export default function TerminalChatInput({
           <TerminalChatInputThinking
             onInterrupt={interruptAgent}
             active={active}
+            thinkingSeconds={thinkingSeconds}
           />
         ) : (
           <Box paddingX={1}>
@@ -718,8 +723,7 @@ export default function TerminalChatInput({
           />
         ) : (
           <Text dimColor>
-            send q or ctrl+c to exit | send "/clear" to reset | send "/help" for
-            commands | press enter to send | shift+enter for new line
+            ctrl+c to exit | "/" to see commands | enter to send
             {contextLeftPercent > 25 && (
               <>
                 {" — "}
@@ -747,12 +751,42 @@ export default function TerminalChatInput({
 function TerminalChatInputThinking({
   onInterrupt,
   active,
+  thinkingSeconds,
 }: {
   onInterrupt: () => void;
   active: boolean;
+  thinkingSeconds: number;
 }) {
-  const [dots, setDots] = useState("");
   const [awaitingConfirm, setAwaitingConfirm] = useState(false);
+  const [dots, setDots] = useState("");
+
+  // Animate ellipsis
+  useInterval(() => {
+    setDots((prev) => (prev.length < 3 ? prev + "." : ""));
+  }, 500);
+
+  // Spinner frames with embedded seconds
+  const ballFrames = [
+    "( ●    )",
+    "(  ●   )",
+    "(   ●  )",
+    "(    ● )",
+    "(     ●)",
+    "(    ● )",
+    "(   ●  )",
+    "(  ●   )",
+    "( ●    )",
+    "(●     )",
+  ];
+  const [frame, setFrame] = useState(0);
+
+  useInterval(() => {
+    setFrame((idx) => (idx + 1) % ballFrames.length);
+  }, 80);
+
+  // Keep the elapsed‑seconds text fixed while the ball animation moves.
+  const frameTemplate = ballFrames[frame] ?? ballFrames[0];
+  const frameWithSeconds = `${frameTemplate} ${thinkingSeconds}s`;
 
   // ---------------------------------------------------------------------
   // Raw stdin listener to catch the case where the terminal delivers two
@@ -798,10 +832,7 @@ function TerminalChatInputThinking({
     };
   }, [stdin, awaitingConfirm, onInterrupt, active, setRawMode]);
 
-  // Cycle the "Thinking…" animation dots.
-  useInterval(() => {
-    setDots((prev) => (prev.length < 3 ? prev + "." : ""));
-  }, 500);
+  // No local timer: the parent component supplies the elapsed time via props.
 
   // Listen for the escape key to allow the user to interrupt the current
   // operation. We require two presses within a short window (1.5s) to avoid
@@ -828,8 +859,11 @@ function TerminalChatInputThinking({
   return (
     <Box flexDirection="column" gap={1}>
       <Box gap={2}>
-        <Spinner type="ball" />
-        <Text>Thinking{dots}</Text>
+        <Text>{frameWithSeconds}</Text>
+        <Text>
+          Thinking
+          {dots}
+        </Text>
       </Box>
       {awaitingConfirm && (
         <Text dimColor>
